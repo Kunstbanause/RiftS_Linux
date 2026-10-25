@@ -11,6 +11,15 @@ This repo bundles a working stack and one window that sets it up and keeps an ey
 
 Not affiliated with Meta or Oculus.
 
+<p align="center">
+  <img src="docs/screenshots/dashboard.png" width="49%" alt="Dashboard: headset, controllers, Monado, WayVR and power, each green / yellow / red with one-click fixes">
+  <img src="docs/screenshots/setup.png" width="49%" alt="Setup tab: each install step with its state and an Install button">
+</p>
+<p align="center">
+  <img src="docs/screenshots/tools.png" width="49%" alt="Tools tab: service control, tests and settings">
+</p>
+<p align="center"><sub>Dashboard (headset unplugged, one line opened) · Setup on a fresh machine · Tools &amp; config</sub></p>
+
 ## Status
 
 Works and is playable: Half-Life: Alyx, Beat Saber (legacy beta, see below).
@@ -88,12 +97,17 @@ git -C ~/RiftS_Linux pull
 
 Then open the Setup tab. Steps with something new show **Update**.
 
+## Similar projects
+
+[lbgos/rift-s-linux](https://github.com/lbgos/rift-s-linux) takes a different route: Monado's Rift S driver inside SteamVR, with more features (SLAM recovery, room setup, IPD, a settings app). [docs/comparison.md](docs/comparison.md) compares the two area by area, so you can pick what suits your setup.
+
 ## More
 
 - [docs/troubleshooting.md](docs/troubleshooting.md): symptoms, causes, fixes
 - [docs/configuration.md](docs/configuration.md): settings (render scale, frame budget, lens, vibration, passthrough, recording)
 - [docs/patches.md](docs/patches.md): what each patch does
 - [docs/manual-setup.md](docs/manual-setup.md): the setup steps as commands
+- [docs/comparison.md](docs/comparison.md): this project vs. lbgos/rift-s-linux
 - [tools/dev/README.md](tools/dev/README.md): tracking analysis tools for developers
 
 ## Credits

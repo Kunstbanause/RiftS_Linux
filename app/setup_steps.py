@@ -405,7 +405,7 @@ class PackagesStep(Step):
     redo = "Install"
     title = "Fedora packages"
     about = ("Build tools and libraries, Basalt (head tracking), udev rules for the headset. "
-             "Asks for your password; shows first what dnf would upgrade.")
+             "Shows first what dnf would install and upgrade.")
     root = True
     duration = "1-5 min"
 
@@ -522,7 +522,7 @@ class SetcapStep(Step):
     key = "setcap"
     redo = "Apply again"
     title = "Realtime GPU priority"
-    about = "setcap CAP_SYS_NICE on monado-service. Asks for your password; needed again after every Monado build."
+    about = "setcap CAP_SYS_NICE on monado-service. Needed again after every Monado build."
     root = True
 
     def check(self):
@@ -681,6 +681,8 @@ class ConfigStep(Step):
         return p
 
     def check(self):
+        if not self.units():
+            return State(MISSING, "Needs Monado first")
         p = self.problems()
         if p:
             return State(MISSING, f"{len(p)} thing{'s' if len(p) != 1 else ''} to set up", p)

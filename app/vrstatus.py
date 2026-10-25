@@ -2572,6 +2572,8 @@ def main_gui():
         win.show()
     if "--screenshot" in sys.argv:  # vrstatus.py --screenshot out.png [tab] [row to open]: grab after 5 s
         args = sys.argv[sys.argv.index("--screenshot") + 1:]
+        if os.environ.get("RIFTS_SCREENSHOT_SIZE"):
+            win.resize(*map(int, os.environ["RIFTS_SCREENSHOT_SIZE"].split("x")))
         win.tabs.setCurrentIndex(int(args[1]) if len(args) > 1 else 0)
         if len(args) > 2:
             win.dash_rows[args[2]].set_expanded(True)

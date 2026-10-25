@@ -1,0 +1,29 @@
+From 7a3d4c16b5b9ce278e23b3d24ceedf6dbd1b538d Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:58:40 +0300
+Subject: [PATCH 26/46] rift_s: require a length byte before reading the
+ proximity state
+
+A 1-byte 0x66 report would read buf[1] past the received data.
+
+(cherry picked from commit eae62eaca2b9326c189df130db159bfc0ec4958a)
+---
+ src/xrt/drivers/rift_s/rift_s.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s.c b/src/xrt/drivers/rift_s/rift_s.c
+index 49dd3e5..3019a85 100644
+--- a/src/xrt/drivers/rift_s/rift_s.c
++++ b/src/xrt/drivers/rift_s/rift_s.c
+@@ -824,7 +824,7 @@ handle_packets(struct rift_s_system *sys)
+ 				handle_hmd_report(sys, now, buf, size);
+ 			else if (buf[0] == 0x67)
+ 				handle_controller_report(sys, now, buf, size);
+-			else if (buf[0] == 0x66) {
++			else if (buf[0] == 0x66 && size >= 2) {
+ 				/* System state packet. Enable the screen if the prox sensor is
+ 				 * triggered. */
+ 				bool prox_sensor = (buf[1] == 0) ? false : true;
+-- 
+2.56.0
+

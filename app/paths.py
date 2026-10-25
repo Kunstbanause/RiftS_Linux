@@ -28,6 +28,9 @@ MANIFEST = DATA / "manifest.json"                # what the setup wrote / instal
 RECORDINGS = DATA / "recordings"
 FIRMWARE = DATA / "hmd-firmware"
 
+BASALT = OPT / "basalt-rifts"                    # Basalt (SLAM head tracking) with patches/basalt
+BASALT_LIB = BASALT / "lib64/libbasalt.so.2"
+FEDORA_BASALT_LIB = Path("/usr/lib64/libbasalt.so.2")   # Fedora's basalt-monado, the fallback
 MONADO = OPT / "monado-6dof"
 MONADO_CTL = MONADO / "bin/monado-ctl"
 MONADO_BIN = MONADO / "bin/monado-service"

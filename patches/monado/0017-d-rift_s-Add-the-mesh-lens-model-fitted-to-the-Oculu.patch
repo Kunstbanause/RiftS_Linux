@@ -1,0 +1,189 @@
+From 49e86b62049feed871cf81b5abc436d74b533b24 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:03:00 +0100
+Subject: [PATCH 17/46] d/rift_s: Add the "mesh" lens model fitted to the
+ Oculus runtime mesh
+
+RIFT_S_DISTORTION=mesh uses the per-colour odd polynomial
+(t, t^3 .. t^9) that lbgos/rift-s-linux fitted to the Meta Horizon
+runtime distortion mesh (< 0.45 px), and its lens centres for the eye
+separation (RIFT_S_LENS_IPD_MM, 63 like the rendered views). The c1
+model stays the default until it is compared in the headset.
+
+At the firmware eye-cup distances the mesh fit gives tangents within
+1 % of the official horizontal FOV edges (c1 = 0.47: 4-7 % inside);
+mid-field both agree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 74406e32eaeebb10c4dd5db2e17ecf99ace780e9)
+---
+ src/xrt/drivers/rift_s/rift_s_hmd.c | 103 +++++++++++++++++++++++++++-
+ src/xrt/drivers/rift_s/rift_s_hmd.h |   2 +
+ 2 files changed, 102 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_hmd.c b/src/xrt/drivers/rift_s/rift_s_hmd.c
+index 291d135..f43b849 100644
+--- a/src/xrt/drivers/rift_s/rift_s_hmd.c
++++ b/src/xrt/drivers/rift_s/rift_s_hmd.c
+@@ -45,8 +45,10 @@
+ #define RIFT_S_VIEW_W 1280
+ #define RIFT_S_VIEW_H 1440
+ 
+-//! "cv1" selects the old Rift CV1 placeholder distortion
++//! "cv1" selects the old Rift CV1 placeholder distortion, "mesh" the fit to the Oculus runtime's mesh
+ DEBUG_GET_ONCE_OPTION(rift_s_distortion, "RIFT_S_DISTORTION", NULL)
++//! Eye separation the "mesh" lens centres are picked for (Monado renders with 63 mm)
++DEBUG_GET_ONCE_FLOAT_OPTION(rift_s_lens_ipd_mm, "RIFT_S_LENS_IPD_MM", 63.0f)
+ //! Radial correction terms of the Rift S lens model, see struct rift_s_lens_model
+ DEBUG_GET_ONCE_FLOAT_OPTION(rift_s_distortion_c1, "RIFT_S_DISTORTION_C1", 0.47f)
+ DEBUG_GET_ONCE_FLOAT_OPTION(rift_s_distortion_c2, "RIFT_S_DISTORTION_C2", 0.0f)
+@@ -169,6 +171,81 @@ rift_s_hmd_handle_report(struct rift_s_hmd *hmd, timepoint_ns local_ts, rift_s_h
+ 	}
+ }
+ 
++/*
++ * "mesh" lens model, from lbgos/rift-s-linux (rift_s_optics.c, BSL-1.0): fitted to the distortion mesh
++ * cache of the Meta Horizon runtime 1.208 (firmware 2.2), identical for both eyes. Per colour channel,
++ * panel pixel radius = k0 t + k1 t^3 + k2 t^5 + k3 t^7 + k4 t^9 for tangent radius t, max fit error
++ * below 0.45 px inside the FOV, monotonic on [0, MESH_TAN_MAX].
++ */
++#define MESH_TAN_MAX 1.7
++static const double mesh_k[3][5] = {
++    {828.9789, -281.8288, 92.5256, -18.9440, 1.7376},  // R
++    {823.6001, -288.6719, 104.1311, -25.0075, 2.8234}, // G
++    {820.1631, -289.5132, 107.2478, -26.7999, 3.1539}, // B
++};
++
++/* Left eye lens centre x the runtime renders with for IPDs 53.5, 55.5, ... 73.5 mm (it shifts the lens
++ * centre with IPD); y is the same for all, the right eye is mirrored. Firmware block 0x12 centres differ
++ * from these by ~2 px. */
++#define MESH_CENTER_IPD_MIN_MM 53.5
++#define MESH_CENTER_IPD_STEP_MM 2.0
++#define MESH_CENTER_COUNT 11
++static const double mesh_left_center_x[MESH_CENTER_COUNT] = {
++    605.495, 605.366, 605.671, 606.293, 607.116, 608.039, 608.962, 609.785, 610.407, 610.712, 610.583,
++};
++#define MESH_CENTER_Y 719.992
++
++static double
++mesh_radius_px(const double *k, double t)
++{
++	const double t2 = t * t;
++	return t * (k[0] + t2 * (k[1] + t2 * (k[2] + t2 * (k[3] + t2 * k[4]))));
++}
++
++static double
++mesh_radius_px_slope(const double *k, double t)
++{
++	const double t2 = t * t;
++	return k[0] + t2 * (3 * k[1] + t2 * (5 * k[2] + t2 * (7 * k[3] + t2 * 9 * k[4])));
++}
++
++//! Inverse of mesh_radius_px (bracketed Newton), continued linearly beyond MESH_TAN_MAX (outside the FOV).
++static double
++mesh_tangent_radius(const double *k, double r)
++{
++	const double r_max = mesh_radius_px(k, MESH_TAN_MAX);
++	if (r >= r_max) {
++		return MESH_TAN_MAX + (r - r_max) / mesh_radius_px_slope(k, MESH_TAN_MAX);
++	}
++	double lo = 0, hi = MESH_TAN_MAX;
++	double t = r / k[0];
++	for (int i = 0; i < 50; i++) {
++		if (!(t > lo && t < hi)) {
++			t = 0.5 * (lo + hi);
++		}
++		const double err = mesh_radius_px(k, t) - r;
++		if (fabs(err) < 1e-9) {
++			break;
++		}
++		if (err > 0) {
++			hi = t;
++		} else {
++			lo = t;
++		}
++		t -= err / mesh_radius_px_slope(k, t);
++	}
++	return t;
++}
++
++static double
++mesh_lens_center_x(double ipd_mm)
++{
++	double pos = (ipd_mm - MESH_CENTER_IPD_MIN_MM) / MESH_CENTER_IPD_STEP_MM;
++	pos = fmin(fmax(pos, 0.0), MESH_CENTER_COUNT - 1);
++	const int i = pos < MESH_CENTER_COUNT - 1 ? (int)pos : MESH_CENTER_COUNT - 2;
++	return mesh_left_center_x[i] + (pos - i) * (mesh_left_center_x[i + 1] - mesh_left_center_x[i]);
++}
++
+ static xrt_result_t
+ rift_s_compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
+ {
+@@ -180,6 +257,19 @@ rift_s_compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float
+ 
+ 	const struct rift_s_lens_model *l = &hmd->lens[view];
+ 
++	if (hmd->use_mesh_distortion) {
++		const double dx = u * RIFT_S_VIEW_W - l->center_px[0];
++		const double dy = v * RIFT_S_VIEW_H - l->center_px[1];
++		const double r = hypot(dx, dy);
++		struct xrt_vec2 *rgb[3] = {&result->r, &result->g, &result->b};
++		for (int i = 0; i < 3; i++) {
++			const double scale = r > 0 ? mesh_tangent_radius(mesh_k[i], r) / r : 0.0;
++			rgb[i]->x = (float)((dx * scale - l->tan_left) / (l->tan_right - l->tan_left));
++			rgb[i]->y = (float)((dy * scale + l->tan_up) / (l->tan_up + l->tan_down));
++		}
++		return XRT_SUCCESS;
++	}
++
+ 	// Panel pixel offset from the lens centre, v grows downwards like the panel rows
+ 	const float dx = u * RIFT_S_VIEW_W - l->center_px[0];
+ 	const float dy = v * RIFT_S_VIEW_H - l->center_px[1];
+@@ -222,6 +312,11 @@ rift_s_setup_lens_model(struct rift_s_hmd *hmd, struct rift_s_hmd_config *config
+ 		// Firmware coordinates span the whole 2560 wide panel, left eye first
+ 		l->center_px[0] = centers[eye][0] - (float)(eye * RIFT_S_VIEW_W);
+ 		l->center_px[1] = centers[eye][1];
++		if (hmd->use_mesh_distortion) {
++			const double cx = mesh_lens_center_x(debug_get_float_option_rift_s_lens_ipd_mm());
++			l->center_px[0] = (float)(eye == 0 ? cx : RIFT_S_VIEW_W - cx);
++			l->center_px[1] = (float)MESH_CENTER_Y;
++		}
+ 		l->pixels_per_tan = 823.28f;
+ 		l->c1 = c1;
+ 		l->c2 = c2;
+@@ -241,8 +336,9 @@ rift_s_setup_lens_model(struct rift_s_hmd *hmd, struct rift_s_hmd_config *config
+ 		fov->angle_up = atanf(l->tan_up);
+ 		fov->angle_down = -atanf(l->tan_down);
+ 
+-		RIFT_S_INFO("Lens model eye %d: centre %.0f,%.0f px, c1 %.3f c2 %.3f, FOV L %.1f R %.1f U %.1f D %.1f deg",
+-		            eye, l->center_px[0], l->center_px[1], l->c1, l->c2, RAD_TO_DEG(fov->angle_left),
++		RIFT_S_INFO("Lens model eye %d: %s, centre %.1f,%.1f px, c1 %.3f c2 %.3f, FOV L %.1f R %.1f U %.1f D %.1f deg",
++		            eye, hmd->use_mesh_distortion ? "mesh fit" : "c1/c2", l->center_px[0], l->center_px[1],
++		            l->c1, l->c2, RAD_TO_DEG(fov->angle_left),
+ 		            RAD_TO_DEG(fov->angle_right), RAD_TO_DEG(fov->angle_up), RAD_TO_DEG(fov->angle_down));
+ 	}
+ }
+@@ -413,6 +509,7 @@ rift_s_hmd_create(struct rift_s_system *sys, const unsigned char *hmd_serial_no,
+ 
+ 	const char *distortion_mode = debug_get_option_rift_s_distortion();
+ 	hmd->use_cv1_distortion = distortion_mode != NULL && strcmp(distortion_mode, "cv1") == 0;
++	hmd->use_mesh_distortion = distortion_mode != NULL && strcmp(distortion_mode, "mesh") == 0;
+ 	if (hmd->use_cv1_distortion) {
+ 		RIFT_S_INFO("Using the Rift CV1 placeholder distortion");
+ 	} else {
+diff --git a/src/xrt/drivers/rift_s/rift_s_hmd.h b/src/xrt/drivers/rift_s/rift_s_hmd.h
+index ef8ce0a..b97ba9c 100644
+--- a/src/xrt/drivers/rift_s/rift_s_hmd.h
++++ b/src/xrt/drivers/rift_s/rift_s_hmd.h
+@@ -50,6 +50,8 @@ struct rift_s_hmd
+ 
+ 	//! Use the old Rift CV1 placeholder distortion instead of the Rift S lens model
+ 	bool use_cv1_distortion;
++	//! Use the per-colour polynomial fitted to the Oculus runtime's distortion mesh
++	bool use_mesh_distortion;
+ 
+ 	/*!
+ 	 * Rift S lens model per eye, in the eye view's pixel coordinates (1280x1440, as the
+-- 
+2.56.0
+

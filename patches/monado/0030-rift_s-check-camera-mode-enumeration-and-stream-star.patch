@@ -1,0 +1,53 @@
+From 3413143fb02ca986418986e062eb9aeee9080858 Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:59:02 +0300
+Subject: [PATCH 30/46] rift_s: check camera mode enumeration and stream start
+
+Unchecked enumerate_modes left modes/count undefined on failure and
+an unchecked stream_start returned a camera that never delivers
+frames. Fail loudly and free the mode list on the error path.
+
+(cherry picked from commit 94b5fa108e3ce67f2ce9a19039bd93de2052a6aa)
+---
+ src/xrt/drivers/rift_s/rift_s_camera.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_camera.c b/src/xrt/drivers/rift_s/rift_s_camera.c
+index 674f010..7aaeb18 100644
+--- a/src/xrt/drivers/rift_s/rift_s_camera.c
++++ b/src/xrt/drivers/rift_s/rift_s_camera.c
+@@ -213,7 +213,10 @@ rift_s_camera_create(struct xrt_prober *xp,
+ 	struct xrt_fs_mode *modes = NULL;
+ 	uint32_t count;
+ 
+-	xrt_fs_enumerate_modes(finder.xfs, &modes, &count);
++	if (!xrt_fs_enumerate_modes(finder.xfs, &modes, &count) || modes == NULL) {
++		RIFT_S_ERROR("Couldn't enumerate camera input formats.");
++		goto cleanup;
++	}
+ 
+ 	bool found_mode = false;
+ 	uint32_t selected_mode = 0;
+@@ -233,6 +236,7 @@ rift_s_camera_create(struct xrt_prober *xp,
+ 	if (!found_mode) {
+ 		selected_mode = 0;
+ 		RIFT_S_ERROR("Couldn't find compatible camera input format.");
++		free(modes);
+ 		goto cleanup;
+ 	}
+ 
+@@ -256,7 +260,10 @@ rift_s_camera_create(struct xrt_prober *xp,
+ 	u_var_add_sink_debug(cam, &cam->debug_sinks[1], "Controller Streams");
+ 
+ 	/* Finally, start the video feed */
+-	xrt_fs_stream_start(finder.xfs, tmp, XRT_FS_CAPTURE_TYPE_TRACKING, selected_mode);
++	if (!xrt_fs_stream_start(finder.xfs, tmp, XRT_FS_CAPTURE_TYPE_TRACKING, selected_mode)) {
++		RIFT_S_ERROR("Couldn't start camera video feed.");
++		goto cleanup;
++	}
+ 
+ 	return cam;
+ 
+-- 
+2.56.0
+

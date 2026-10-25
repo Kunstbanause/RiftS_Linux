@@ -1,9 +1,11 @@
 #!/bin/bash
 # Count Monado "missed frame" warnings with hello_xr for several compositor time budgets.
 # Usage: measure-pacing.sh <min_comp_time_ms> ...  (systemd monado units must be stopped)
+# Patched Basalt from the setup, else Fedora's
+BASALT_LIB=$HOME/.local/opt/basalt-rifts/lib64/libbasalt.so.2; [ -e "$BASALT_LIB" ] || BASALT_LIB=/usr/lib64/libbasalt.so.2
 for ms in "$@"; do
 	env U_PACING_COMP_MIN_TIME_MS=$ms XRT_COMPOSITOR_SCALE_PERCENTAGE=100 RIFT_S_DISTORTION_C1=0.47 \
-		VIT_SYSTEM_LIBRARY_PATH=/usr/lib64/libbasalt.so.2 RIFT_S_HANDTRACKING=0 \
+		VIT_SYSTEM_LIBRARY_PATH=$BASALT_LIB RIFT_S_HANDTRACKING=0 \
 		"$HOME/.local/opt/monado-6dof/bin/monado-service" < <(sleep 40) > /tmp/pacing_$ms.log 2>&1 &
 	sleep 8
 	(sleep 20 | timeout 20 hello_xr -g Vulkan2 > /dev/null 2>&1 &)

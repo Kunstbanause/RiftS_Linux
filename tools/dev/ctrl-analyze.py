@@ -324,6 +324,9 @@ def tracker_metrics(rec, t0, t1):
     ran = np.nonzero(np.diff(t["long_run"][w]) > 0)[0] + 1
     m["full search/s"] = np.diff(t["long_run"][w]).sum() / dur
     m["superseded/s"] = np.diff(t["long_superseded"][w]).sum() / dur
+    if "long_wide" in t:
+        # Device searches without the prior position bound (lost devices, patch 0046)
+        m["wide search/s"] = np.diff(t["long_wide"][w]).sum() / dur
     if len(ran):
         m["search p95 ms"] = float(np.percentile(t["long_ms"][w][ran], 95))
     return m

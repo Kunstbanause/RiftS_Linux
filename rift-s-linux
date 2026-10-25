@@ -12,9 +12,10 @@ case "$1" in
 	setup|--once) exec python3 "$APP" "$@" ;;
 esac
 VENV="${RIFTS_HOME:-$HOME}/.local/opt/rift-s-linux/venv"
-if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c "import PySide6" 2>/dev/null; then
-	echo "First start: creating $VENV with PySide6 from pip (~250 MB, no root, nothing system-wide)..."
-	python3 -m venv "$VENV"
-	"$VENV/bin/pip" install -q --disable-pip-version-check PySide6-Essentials
+if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c "import PySide6, numpy" 2>/dev/null; then
+	echo "First start: creating $VENV with PySide6 and numpy from pip (~280 MB, no root, nothing system-wide)..."
+	[ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
+	# numpy: the tracking protocol's analysis (tools/dev/ctrl-analyze.py)
+	"$VENV/bin/pip" install -q --disable-pip-version-check PySide6-Essentials numpy
 fi
 exec "$VENV/bin/python" "$APP" "$@"

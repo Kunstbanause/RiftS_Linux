@@ -1004,6 +1004,10 @@ class Collector:
 
         env = read_conf()
         broken = [k for k in setup_steps.REQUIRED_ENV if env.get(k) != DEFAULTS[k]]
+        # Head tracking library: the patched Basalt, or Fedora's as the fallback; broken only if missing
+        vit = env.get("VIT_SYSTEM_LIBRARY_PATH")
+        if vit and Path(setup_steps.expand_h(vit)).exists():
+            broken = [k for k in broken if k != "VIT_SYSTEM_LIBRARY_PATH"]
         diffs = [k for k, v in DEFAULTS.items() if env.get(k) != v and k not in broken]
         val = ", ".join(f"{k}={v}" for k, v in env.items() if k.startswith(("XRT", "U_", "RIFT_S")))
         checks.append(Check("mo.config", "Config", RED if broken else GREEN, val or "no rift-s.conf",
@@ -1454,8 +1458,8 @@ class Actions:
                 self.sh(["systemctl", "--user", "restart", "monado.socket"])
 
     def set_lens(self, value):
-        if value == "cv1":
-            self.apply_conf({"RIFT_S_DISTORTION_C1": None, "RIFT_S_DISTORTION": "cv1"})
+        if value in ("cv1", "mesh"):
+            self.apply_conf({"RIFT_S_DISTORTION_C1": None, "RIFT_S_DISTORTION": value})
         else:
             self.apply_conf({"RIFT_S_DISTORTION": None, "RIFT_S_DISTORTION_C1": value})
 
@@ -2279,6 +2283,10 @@ def main_gui():
             apply.clicked.connect(self.apply_config)
             form.addRow(apply)
             lens = QtWidgets.QHBoxLayout()
+            b = QtWidgets.QPushButton("Mesh model")
+            b.setToolTip("Fitted to the Oculus runtime's distortion mesh (patch 0017, the default)")
+            b.clicked.connect(lambda: self.do(lambda: self.actions.set_lens("mesh")))
+            lens.addWidget(b)
             self.cfg_c1 = QtWidgets.QDoubleSpinBox()
             self.cfg_c1.setRange(0.30, 0.65)
             self.cfg_c1.setSingleStep(0.01)
@@ -2291,7 +2299,7 @@ def main_gui():
             b = QtWidgets.QPushButton("CV1 model")
             b.clicked.connect(lambda: self.do(lambda: self.actions.set_lens("cv1")))
             lens.addWidget(b)
-            form.addRow("Lens c1", lens)
+            form.addRow("Lens model", lens)
             grid.addWidget(box, 1, 0, 1, 2)
 
             box = QtWidgets.QGroupBox("Options")

@@ -1,0 +1,33 @@
+From 7c3a7d0855419410806e2dcb8e862aeca576119d Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:58:47 +0100
+Subject: [PATCH 42/46] tests: Build the rift_s radio queue tests
+
+Brought in with the cherry-picked radio queue commit, without the
+haptics source that lbgos/rift-s-linux links it with (unused here).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/CMakeLists.txt | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index eb81190..d1b0055 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -71,6 +71,12 @@ if(XRT_BUILD_DRIVER_RIFT_S)
+ 	target_link_libraries(tests_rift_s_controller_fusion PRIVATE xrt-external-catch2 aux_math xrt-interfaces)
+ 	add_test(NAME tests_rift_s_controller_fusion COMMAND tests_rift_s_controller_fusion)
+ 	set_target_properties(tests_rift_s_controller_fusion PROPERTIES FOLDER monado_tests)
++
++	add_executable(tests_rift_s_radio tests_rift_s_radio.cpp ${CMAKE_SOURCE_DIR}/src/xrt/drivers/rift_s/rift_s_radio.c)
++	target_include_directories(tests_rift_s_radio PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/drivers)
++	target_link_libraries(tests_rift_s_radio PRIVATE xrt-external-catch2 aux_util)
++	add_test(NAME tests_rift_s_radio COMMAND tests_rift_s_radio)
++	set_target_properties(tests_rift_s_radio PROPERTIES FOLDER monado_tests)
+ endif()
+ target_link_libraries(tests_lowpass_float PRIVATE aux_math)
+ target_link_libraries(tests_lowpass_integer PRIVATE aux_math)
+-- 
+2.56.0
+

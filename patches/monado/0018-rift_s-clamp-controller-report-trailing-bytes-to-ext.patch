@@ -1,0 +1,35 @@
+From c77fc7359884e4fe27aac5693abd33a77c759e03 Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:57:55 +0300
+Subject: [PATCH 18/46] rift_s: clamp controller report trailing bytes to
+ extra_bytes
+
+data_len is device-controlled; unparsed trailing bytes could exceed
+the 48-byte spill buffer and smash the stack. Keep what fits.
+
+(cherry picked from commit 8e8cdbb450518be24e3ff0cc8c08760a082ac318)
+---
+ src/xrt/drivers/rift_s/rift_s_protocol.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_protocol.c b/src/xrt/drivers/rift_s/rift_s_protocol.c
+index 079559e..d36152c 100644
+--- a/src/xrt/drivers/rift_s/rift_s_protocol.c
++++ b/src/xrt/drivers/rift_s/rift_s_protocol.c
+@@ -124,7 +124,12 @@ rift_s_parse_controller_report(rift_s_controller_report_t *report, const unsigne
+ 	}
+ 
+ 	if (avail > 0) {
+-		assert(avail < sizeof(report->extra_bytes));
++		/* Trailing bytes from unknown or future block types must not overflow the spill buffer. */
++		if (avail > sizeof(report->extra_bytes)) {
++			RIFT_S_WARN("Controller report has %u trailing bytes, keeping %zu", avail,
++			            sizeof(report->extra_bytes));
++			avail = sizeof(report->extra_bytes);
++		}
+ 		report->extra_bytes_len = avail;
+ 		memcpy(report->extra_bytes, buf, avail);
+ 	}
+-- 
+2.56.0
+

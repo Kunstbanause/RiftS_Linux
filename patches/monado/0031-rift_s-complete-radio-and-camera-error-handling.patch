@@ -1,0 +1,110 @@
+From b790bcb1aeb7a355306db59add10ea905006a215 Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:30:42 +0300
+Subject: [PATCH 31/46] rift_s: complete radio and camera error handling
+
+(cherry picked from commit e8c8b078e8431b925c812091be8fcd9fab768288)
+---
+ src/xrt/drivers/rift_s/rift_s_camera.c   |  1 +
+ src/xrt/drivers/rift_s/rift_s_firmware.c |  4 ++--
+ src/xrt/drivers/rift_s/rift_s_radio.c    | 21 +++++++++++++++++----
+ 3 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_camera.c b/src/xrt/drivers/rift_s/rift_s_camera.c
+index 7aaeb18..36076a5 100644
+--- a/src/xrt/drivers/rift_s/rift_s_camera.c
++++ b/src/xrt/drivers/rift_s/rift_s_camera.c
+@@ -215,6 +215,7 @@ rift_s_camera_create(struct xrt_prober *xp,
+ 
+ 	if (!xrt_fs_enumerate_modes(finder.xfs, &modes, &count) || modes == NULL) {
+ 		RIFT_S_ERROR("Couldn't enumerate camera input formats.");
++		free(modes);
+ 		goto cleanup;
+ 	}
+ 
+diff --git a/src/xrt/drivers/rift_s/rift_s_firmware.c b/src/xrt/drivers/rift_s/rift_s_firmware.c
+index 11d2feb..7a1948a 100644
+--- a/src/xrt/drivers/rift_s/rift_s_firmware.c
++++ b/src/xrt/drivers/rift_s/rift_s_firmware.c
+@@ -210,7 +210,7 @@ rift_s_config_parse_camera_config(struct rift_s_camera_calibration *cam_config,
+ 	const char *projection_model = cJSON_GetStringValue(item);
+ 	if (projection_model == NULL || strcmp(projection_model, "PinholeSymmetric") != 0) {
+ 		RIFT_S_ERROR("Missing/invalid camera projection model type %s in camera %d",
+-		             item != NULL ? cJSON_GetStringValue(item) : "NULL", camera_id);
++		             projection_model != NULL ? projection_model : "NULL", camera_id);
+ 		return false;
+ 	}
+ 
+@@ -233,7 +233,7 @@ rift_s_config_parse_camera_config(struct rift_s_camera_calibration *cam_config,
+ 	const char *distortion_model = cJSON_GetStringValue(item);
+ 	if (distortion_model == NULL || strcmp(distortion_model, "Fisheye62") != 0) {
+ 		RIFT_S_ERROR("Missing/invalid camera distortion model type %s in camera %d",
+-		             item != NULL ? cJSON_GetStringValue(item) : "NULL", camera_id);
++		             distortion_model != NULL ? distortion_model : "NULL", camera_id);
+ 		return false;
+ 	}
+ 
+diff --git a/src/xrt/drivers/rift_s/rift_s_radio.c b/src/xrt/drivers/rift_s/rift_s_radio.c
+index 3203090..b676640 100644
+--- a/src/xrt/drivers/rift_s/rift_s_radio.c
++++ b/src/xrt/drivers/rift_s/rift_s_radio.c
+@@ -148,6 +148,7 @@ rift_s_radio_state_clear(rift_s_radio_state *state)
+ 	}
+ 
+ 	state->pending_commands = state->pending_commands_tail = NULL;
++	state->command_result_pending = false;
+ }
+ 
+ void
+@@ -181,17 +182,24 @@ queue_report(rift_s_radio_state *state,
+              void *cb_data)
+ {
+ 	rift_s_radio_command *cmd = U_TYPED_CALLOC(rift_s_radio_command);
+-	if (cmd == NULL)
++	if (cmd == NULL) {
++		if (cb)
++			cb(false, NULL, 0, cb_data);
+ 		return;
++	}
+ 
+-	if (cmd_bytes_len < 0 || cmd_bytes_len > (int)sizeof(cmd->read_command.cmd_bytes)) {
++	if (cmd_bytes_len < 0 || cmd_bytes_len > (int)sizeof(cmd->read_command.cmd_bytes) ||
++	    (cmd_bytes_len > 0 && cmd_bytes == NULL)) {
+ 		free(cmd);
++		if (cb)
++			cb(false, NULL, 0, cb_data);
+ 		return;
+ 	}
+ 
+ 	cmd->read_command.cmd = report_id;
+ 	cmd->read_command.device_id = device_id;
+-	memcpy(cmd->read_command.cmd_bytes, cmd_bytes, cmd_bytes_len);
++	if (cmd_bytes_len > 0)
++		memcpy(cmd->read_command.cmd_bytes, cmd_bytes, cmd_bytes_len);
+ 	cmd->cb = cb;
+ 	cmd->cb_data = cb_data;
+ 
+@@ -337,7 +345,7 @@ read_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, rift
+ 
+ fail:
+ 	if (json_read->cb)
+-		json_read->cb(success, json_read->data, json_read->data_len, json_read->cb_data);
++		json_read->cb(false, json_read->data, json_read->data_len, json_read->cb_data);
+ 	free(json_read);
+ 	return;
+ }
+@@ -350,6 +358,11 @@ rift_s_radio_get_json_block(rift_s_radio_state *state,
+ {
+ 	/* Configuration JSON block reading */
+ 	rift_s_radio_json_read_state *json_read = U_TYPED_CALLOC(rift_s_radio_json_read_state);
++	if (json_read == NULL) {
++		if (cb)
++			cb(false, NULL, 0, cb_data);
++		return;
++	}
+ 	/* cmd  = 0x2b  reply_buffer_len = 0x20  timeout(?) = 0x3e8 (=1000) offset = 0u32   len = 0x20 */
+ 	const uint8_t read_cmd[] = {0x2b, 0x20, 0xe8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00};
+ 
+-- 
+2.56.0
+

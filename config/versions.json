@@ -1,4 +1,8 @@
 {
+  "basalt": {
+    "repo": "https://gitlab.freedesktop.org/mateosss/basalt.git",
+    "commit": "df6e970c8da7636eb401a09e3317fbeaaf829b9a"
+  },
   "monado": {
     "repo": "https://gitlab.freedesktop.org/thaytan/monado.git",
     "branch": "dev-constellation-controller-tracking",
@@ -7,7 +11,10 @@
   "xrizer": {
     "repo": "https://github.com/Supreeeme/xrizer.git",
     "commit": "0519ded7421e608805d710be01fdc51303eda16a",
-    "prebuilt": {"url": "", "sha256": ""}
+    "prebuilt": {
+      "url": "",
+      "sha256": ""
+    }
   },
   "wayvr": {
     "version": "v26.8.0",

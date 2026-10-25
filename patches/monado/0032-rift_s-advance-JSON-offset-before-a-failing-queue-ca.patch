@@ -1,0 +1,31 @@
+From 3ba251b4b9fe99a1ba5fefb774c62d9edf98fab5 Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:31:05 +0300
+Subject: [PATCH 32/46] rift_s: advance JSON offset before a failing queue
+ callback
+
+(cherry picked from commit 42bc93ce99ec3a0e0f6438b489dfd0a5a231b16a)
+---
+ src/xrt/drivers/rift_s/rift_s_radio.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_radio.c b/src/xrt/drivers/rift_s/rift_s_radio.c
+index b676640..17afc09 100644
+--- a/src/xrt/drivers/rift_s/rift_s_radio.c
++++ b/src/xrt/drivers/rift_s/rift_s_radio.c
+@@ -337,10 +337,10 @@ read_json_cb(bool success, uint8_t *response_bytes, int response_bytes_len, rift
+ 	read_cmd[7] = json_read->cur_offset >> 24;
+ 	read_cmd[8] = read_len;
+ 
++	// Queue failure may synchronously finish and free json_read.
++	json_read->cur_offset += read_len;
+ 	rift_s_radio_queue_command(json_read->state, json_read->device_id, read_cmd, sizeof(read_cmd),
+ 	                           (rift_s_radio_completion_fn)read_json_cb, json_read);
+-
+-	json_read->cur_offset += read_len;
+ 	return;
+ 
+ fail:
+-- 
+2.56.0
+

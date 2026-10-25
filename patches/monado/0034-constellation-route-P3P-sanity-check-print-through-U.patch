@@ -1,0 +1,48 @@
+From c61518df2af1bf41f3ddda2a3e1502701a8af2d5 Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:01:23 +0300
+Subject: [PATCH 34/46] constellation: route P3P sanity-check print through
+ U_LOG_D
+
+check_led_against_model_subset() used printf on the per-frame search
+path, bypassing log levels and spamming stdout whenever lambdatwist
+returns an inconsistent root. Log at debug level instead.
+
+(cherry picked from commit 501ca420a5e919f86bb8399104c9a76a5e27b638)
+---
+ .../constellation/internal/correspondence_search.c   | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/xrt/tracking/constellation/internal/correspondence_search.c b/src/xrt/tracking/constellation/internal/correspondence_search.c
+index b99af82..6694bba 100644
+--- a/src/xrt/tracking/constellation/internal/correspondence_search.c
++++ b/src/xrt/tracking/constellation/internal/correspondence_search.c
+@@ -22,6 +22,7 @@
+ 
+ #include "math/m_vec3.h"
+ #include "os/os_time.h"
++#include "util/u_logging.h"
+ 
+ #include "lambdatwist/lambdatwist_p3p.h"
+ #include "correspondence_search.h"
+@@ -509,12 +510,11 @@ check_led_against_model_subset(struct correspondence_search *cs,
+ 			tmp = m_vec3_sub(checkpos, tmpblob);
+ 			l = m_vec3_len(tmp);
+ 			if (!(l <= 0.0025)) {
+-				printf(
+-				    "Error pose candidate orient %f %f %f %f pos %f %f %f "
+-				    "LED %d @ %f %f %f projected to %f %f %f (err %f)\n",
+-				    pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
+-				    pose.position.x, pose.position.y, pose.position.z, p, tmpblob.x, tmpblob.y,
+-				    tmpblob.z, checkpos.x, checkpos.y, checkpos.z, l);
++				U_LOG_D("Error pose candidate orient %f %f %f %f pos %f %f %f "
++				        "LED %d @ %f %f %f projected to %f %f %f (err %f)",
++				        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
++				        pose.position.x, pose.position.y, pose.position.z, p, tmpblob.x, tmpblob.y,
++				        tmpblob.z, checkpos.x, checkpos.y, checkpos.z, l);
+ 				checks_failed = true;
+ 				break; /* FIXME: Figure out why this happened */
+ 			}
+-- 
+2.56.0
+

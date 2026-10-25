@@ -1,0 +1,80 @@
+From 4ee6643c12e4b300e1d0c792c5d7906e5f449195 Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:01:11 +0300
+Subject: [PATCH 33/46] constellation: guard blobwatch observation release with
+ bw_lock
+
+sample_free() pushes observations back to the blobwatch queue from
+both the fast and the long thread, while process() pops under
+bw_lock. Take bw_lock around the release so concurrent free/process
+pairs cannot corrupt the queue head/tail and hand one observation
+buffer to two samples.
+
+(cherry picked from commit 2995c7a7fd9151dcdbeb8f4f6d46a052589be265)
+---
+ src/xrt/tracking/constellation/internal/sample.c          | 8 ++++++++
+ src/xrt/tracking/constellation/internal/sample.h          | 8 ++++++++
+ src/xrt/tracking/constellation/t_constellation_tracking.c | 1 +
+ 3 files changed, 17 insertions(+)
+
+diff --git a/src/xrt/tracking/constellation/internal/sample.c b/src/xrt/tracking/constellation/internal/sample.c
+index 6555b51..b8df6b9 100644
+--- a/src/xrt/tracking/constellation/internal/sample.c
++++ b/src/xrt/tracking/constellation/internal/sample.c
+@@ -27,7 +27,15 @@ constellation_tracking_sample_free(struct constellation_tracking_sample *sample)
+ 		xrt_frame_reference(&view->vframe, NULL);
+ 		if (view->bwobs != NULL) {
+ 			assert(view->bw != NULL);
++			/* The fast thread pops observations under bw_lock while
++			 * both threads push them back here; serialize the push. */
++			if (view->bw_lock != NULL) {
++				os_mutex_lock(view->bw_lock);
++			}
+ 			blobwatch_release_observation(view->bw, view->bwobs);
++			if (view->bw_lock != NULL) {
++				os_mutex_unlock(view->bw_lock);
++			}
+ 		}
+ 	}
+ 
+diff --git a/src/xrt/tracking/constellation/internal/sample.h b/src/xrt/tracking/constellation/internal/sample.h
+index 7c0c6b0..a9dbede 100644
+--- a/src/xrt/tracking/constellation/internal/sample.h
++++ b/src/xrt/tracking/constellation/internal/sample.h
+@@ -17,6 +17,8 @@
+ #include "blobwatch.h"
+ #include "pose_metrics.h"
+ 
++#include "os/os_threading.h"
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -67,6 +69,12 @@ struct tracking_sample_frame
+ 
+ 	/* blobs observation and the owning blobwatch */
+ 	blobwatch *bw;
++	/* Lock guarding bw's observation queue for the release in
++	 * constellation_tracking_sample_free(). The fast thread pops in
++	 * blobwatch_process() under this lock, but both the fast and the
++	 * long thread push back via sample_free(), so the release must take
++	 * it too. NULL when single-threaded (tests). */
++	struct os_mutex *bw_lock;
+ 	blobservation *bwobs;
+ };
+ 
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracking.c b/src/xrt/tracking/constellation/t_constellation_tracking.c
+index 10be615..3fde3ba 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracking.c
++++ b/src/xrt/tracking/constellation/t_constellation_tracking.c
+@@ -902,6 +902,7 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
+ 
+ 		u_frame_create_roi(xf, cam->roi, &view->vframe);
+ 		view->bw = cam->bw;
++		view->bw_lock = &cam->bw_lock;
+ 
+ 		os_mutex_lock(&cam->bw_lock);
+ 		blobwatch_process(cam->bw, view->vframe, &view->bwobs);
+-- 
+2.56.0
+

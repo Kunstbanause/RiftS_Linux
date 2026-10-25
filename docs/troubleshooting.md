@@ -17,6 +17,9 @@ The status window (`rift-s-linux`) catches most of these and shows the fix on th
 | xrizer error dialog "not yet implemented" | The game calls an OpenVR function xrizer doesn't have yet | See `~/.local/state/xrizer/xrizer.txt`, report it to xrizer |
 | GPU queue priority MEDIUM instead of REALTIME (Details tab) | `setcap` lost: every Monado rebuild removes it | Setup tab: Realtime GPU priority |
 | No permission on `/dev/hidraw*` | udev rules missing | Setup tab: Fedora packages (`xr-hardware`), then replug the headset |
+| Head tracking feels laggier or uses more CPU after the Basalt update | The patched Basalt uses 4 worker threads | Try `BASALT_MAX_THREADS=2` or `3` in `rift-s.conf`, or set `VIT_SYSTEM_LIBRARY_PATH=/usr/lib64/libbasalt.so.2` for Fedora's Basalt (Configuration doc) |
+| Out of memory while the setup builds Basalt | Basalt's files need several GB each to compile | The setup uses at most 3 jobs, fewer when memory is low; close big programs (browser, games) during that step |
+| A controller jumps away and stays lost for many seconds although it is in view | A wrong LED match was accepted and the search stayed near it (fixed in patch 0046) | Should recover within ~1.5 s now; `CONSTELLATION_WIDE_SEARCH=0` turns the fix off if it causes trouble |
 
 ## Logs
 
@@ -27,6 +30,6 @@ The status window (`rift-s-linux`) catches most of these and shows the fix on th
 
 ## Notes
 
-- `monado-service` is started on demand by `monado.socket` when a game connects. It keeps about 3 CPU cores busy until you stop it.
+- `monado-service` is started on demand by `monado.socket` when a game connects. It keeps about 1.5 CPU cores busy until you stop it (about 3 with Fedora's Basalt).
 - Never install or start SteamVR alongside this. It rewrites `~/.config/openvr/openvrpaths.vrpath` (disabling xrizer) and brings its own compositor.
 - To run Monado by hand (A/B tests), stop the systemd units first. `monado-service` needs a stdin that stays open: see `tools/dev/run-monado.sh`.

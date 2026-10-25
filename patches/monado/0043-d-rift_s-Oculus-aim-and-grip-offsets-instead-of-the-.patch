@@ -1,0 +1,140 @@
+From d593483cc2fb807dff36adc1894fdc8670b16c4c Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:04:40 +0100
+Subject: [PATCH 43/46] d/rift_s: Oculus aim and grip offsets instead of the
+ WMR placeholder
+
+Port the Rift S pose frames from lbgos/rift-s-linux: Oculus SteamVR
+HandPoseFromModel (render model 39.4 deg about X in the device frame),
+the OpenXR grip of the render model (20.6 deg, ~10 cm back: the grip
+xrizer's oculus_touch profile assumes, so its raw pose lands on the
+model origin) and the Windows LCON aim offset. In the device frame:
+aim 5.5 cm in front of the origin with the device orientation (was the
+origin), grip 60 deg up about X at (0, -3, +4) cm (was 40 deg at
+(0, 0, +10) cm). RIFT_S_POSE_OFFSETS=wmr restores the old offsets.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_controller.c | 61 ++++++++++++++++++----
+ src/xrt/drivers/rift_s/rift_s_controller.h |  5 +-
+ 2 files changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index 83baef0..0df343e 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -49,6 +49,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(rift_s_ctrl_fusion, "RIFT_S_CTRL_FUSION", true)
+ DEBUG_GET_ONCE_OPTION(rift_s_ctrl_record, "RIFT_S_CTRL_RECORD", NULL)
+ //! Holding the Oculus button (right controller) this long toggles passthrough, 0 disables it
+ DEBUG_GET_ONCE_NUM_OPTION(rift_s_passthrough_hold_ms, "RIFT_S_PASSTHROUGH_HOLD_MS", 600)
++//! "wmr" selects the old placeholder aim / grip offsets instead of the Oculus ones
++DEBUG_GET_ONCE_OPTION(rift_s_pose_offsets, "RIFT_S_POSE_OFFSETS", NULL)
+ 
+ //! Approximate controller IMU sample rate, sizes the clock estimator window (1 s)
+ #define CTRL_IMU_CLOCK_WINDOW 500
+@@ -705,6 +707,39 @@ rift_s_controller_get_fusion_pose(struct rift_s_controller *ctrl,
+ 	    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
+ }
+ 
++static struct xrt_pose
++pose_about_x(float deg, float x, float y, float z)
++{
++	struct xrt_pose p = XRT_POSE_IDENTITY;
++	const struct xrt_vec3 axis = {1, 0, 0};
++	math_quat_from_angle_vector(DEG_TO_RAD(deg), &axis, &p.orientation);
++	p.position = (struct xrt_vec3){x, y, z};
++	return p;
++}
++
++/*!
++ * Aim and grip poses in the device (firmware LED model) frame, from lbgos/rift-s-linux
++ * (BSL-1.0): the Oculus SteamVR driver's HandPoseFromModel puts the render model in the device
++ * frame (39.4 deg about X); the OpenXR grip is 20.6 deg about X and ~10 cm back in the render
++ * model (the grip xrizer's oculus_touch profile assumes), the aim is the Windows LCON offset
++ * (grip = aim * (60 deg about X, (0, -0.03, 0.095) m)). In the device frame that is: aim
++ * 5.5 cm in front of the origin with the device orientation, grip 60 deg up at (0, -3, +4) cm.
++ */
++static void
++rift_s_controller_pose_offsets(bool left, struct xrt_pose *out_device_aim, struct xrt_pose *out_device_grip)
++{
++	const float sx = left ? 1.0f : -1.0f;
++	struct xrt_pose device_model = {
++	    .orientation = {0.3371f, 0.0f, 0.0f, 0.94147f},
++	    .position = {-0.007f * sx, 0.036124f, -0.037617f},
++	};
++	math_quat_normalize(&device_model.orientation);
++	const struct xrt_pose model_grip = pose_about_x(20.6f, 0.007f * sx, -0.00182941f, 0.1019482f);
++	const struct xrt_pose model_aim = pose_about_x(-39.4f, 0.007f * sx, -0.03894766f, 0.00949694f);
++	math_pose_transform(&device_model, &model_grip, out_device_grip);
++	math_pose_transform(&device_model, &model_aim, out_device_aim);
++}
++
+ static xrt_result_t
+ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
+                                    enum xrt_input_name name,
+@@ -722,11 +757,10 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
+ 	struct xrt_relation_chain xrc = {0};
+ 
+ 	os_mutex_lock(&ctrl->mutex);
+-	if (name == XRT_INPUT_TOUCH_AIM_POSE) {
+-		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
+-	} else if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
+-		// Leaf first: grip in device (aim) space, then device in IMU space
+-		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
++	if (name == XRT_INPUT_TOUCH_AIM_POSE || name == XRT_INPUT_TOUCH_GRIP_POSE) {
++		// Leaf first: aim / grip in device space, then device in IMU space
++		m_relation_chain_push_pose(&xrc, name == XRT_INPUT_TOUCH_AIM_POSE ? &ctrl->P_device_aim
++		                                                                  : &ctrl->P_device_grip);
+ 		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
+ 	}
+ 
+@@ -1109,11 +1143,15 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
+ 
+ 	os_mutex_init(&ctrl->mutex);
+ 
+-	/* Default grip pose up by 40° degrees around the X axis and back about 10cm in Z */
+-	struct xrt_vec3 translation = {0.0, 0, 0.1};
+-	struct xrt_vec3 axis = {1.0, 0, 0};
+-	math_quat_from_angle_vector(DEG_TO_RAD(40), &axis, &ctrl->P_aim_grip.orientation);
+-	ctrl->P_aim_grip.position = translation;
++	const char *pose_offsets = debug_get_option_rift_s_pose_offsets();
++	if (pose_offsets != NULL && strcmp(pose_offsets, "wmr") == 0) {
++		/* Old placeholder: aim at the device origin, grip up by 40° around X and back about 10cm in Z */
++		ctrl->P_device_aim = (struct xrt_pose)XRT_POSE_IDENTITY;
++		ctrl->P_device_grip = pose_about_x(40.0f, 0.0f, 0.0f, 0.1f);
++	} else {
++		rift_s_controller_pose_offsets(device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, &ctrl->P_device_aim,
++		                               &ctrl->P_device_grip);
++	}
+ 
+ 	u_device_populate_function_pointers(&ctrl->base, rift_s_controller_get_tracked_pose, rift_s_controller_destroy);
+ 	ctrl->base.update_inputs = rift_s_controller_update_inputs;
+@@ -1178,7 +1216,8 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
+ 	u_var_add_gui_header(ctrl, NULL, "Tracking");
+ 	u_var_add_pose(ctrl, &ctrl->pose, "Tracked Pose");
+ 
+-	u_var_add_pose(ctrl, &ctrl->P_aim_grip, "Grip pose offset");
++	u_var_add_pose(ctrl, &ctrl->P_device_aim, "Aim pose in device frame");
++	u_var_add_pose(ctrl, &ctrl->P_device_grip, "Grip pose in device frame");
+ 
+ 	u_var_add_gui_header(ctrl, NULL, "3DoF Tracking");
+ 	m_imu_3dof_add_vars(&ctrl->fusion, ctrl, "");
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.h b/src/xrt/drivers/rift_s/rift_s_controller.h
+index 69ce13a..e7eb477 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller.h
+@@ -119,8 +119,9 @@ struct rift_s_controller
+ 	//! Offset for device pose from imu
+ 	struct xrt_pose P_imu_device;
+ 
+-	//! Offset for grip pose
+-	struct xrt_pose P_aim_grip;
++	//! Aim and grip poses in the device frame
++	struct xrt_pose P_device_aim;
++	struct xrt_pose P_device_grip;
+ 
+ 	/* Controls / buttons state */
+ 	timepoint_ns last_controls_local_time_ns;
+-- 
+2.56.0
+

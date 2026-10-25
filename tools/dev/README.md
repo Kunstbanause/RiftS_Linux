@@ -10,7 +10,7 @@ For working on controller tracking, vibration and frame pacing. You don't need t
   - fix rate, accepted %, latency
   - dropouts (> 0.2 s without an accepted fix), wrong matches (> 20° from the filter), implausible fixes
   - excursions, tracked % and jitter of the replayed 80 Hz filter output, controller separation
-  - tracker dropped frames and search times
+  - tracker dropped frames and search times, and wide searches for lost controllers (patch 0046)
 
   Filter metrics come from replaying the recording through the current filter, so `--compare-args` A/Bs filter parameters on one recording. Needs `replay` (below).
 - **`replay.cpp`**: offline replay of a recording through the fusion filter, with `key=value` parameter overrides, `skip_s=`, `imu_offset_ms=`, `accel_scale=`, `lever=x,y,z`, `--out out.csv` and `--trace out.csv`. Build:
@@ -20,6 +20,13 @@ For working on controller tracking, vibration and frame pacing. You don't need t
   ```
 
   The fusion filter has unit tests too: reconfigure the build with `-DBUILD_TESTING=ON` (the setup builds without), then `ctest -R rift_s` in the build directory.
+
+- **`motion-replay.cpp <recording> [--gap s] [--reliable cov=m2|age=ms] [--models list] [--per-window out.csv]`**: offline evaluation of the occlusion motion models (patch 0044) on a protocol recording. Both controllers go through the fusion filter with the recorded head pose. It reports:
+  - synthetic occlusion: fixes cut out of well-tracked stretches, scored against the cut-out fixes;
+  - the error at re-acquisition after real dropouts;
+  - model activity while the controller was tracked, and output teleports.
+
+  Build like `replay.cpp`, plus `$M/src/xrt/drivers/rift_s/rift_s_motion.cpp` and `-o motion-replay`.
 
 ## Vibration
 

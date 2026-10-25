@@ -1,0 +1,100 @@
+From 7a01155a8e46891f8a57c57e2ee52be011656bf3 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:34:38 +0100
+Subject: [PATCH 45/46] d/rift_s: Expose the newest fusion state for the motion
+ models
+
+rift_s_ctrl_fusion_get_newest_sample(): pose, velocity, gravity-free
+acceleration, body angular rate, position covariance diagonal, last fix
+time and the hold flag after the newest IMU sample. Used by the offline
+evaluation (RiftS tools/motion-replay.cpp); the driver does not call it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rift_s/rift_s_controller_fusion.cpp       | 29 +++++++++++++++++++
+ .../drivers/rift_s/rift_s_controller_fusion.h | 22 ++++++++++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+index 58dea7f..9bcf13f 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+@@ -325,6 +325,29 @@ public:
+ 		return true;
+ 	}
+ 
++	bool
++	newest_sample(rift_s_ctrl_fusion_sample &out) const
++	{
++		out = rift_s_ctrl_fusion_sample{};
++		if (!initialised_ || history_.empty()) {
++			return false;
++		}
++		const HistoryEntry &e = history_.back();
++		out.timestamp_ns = e.ts;
++		xrt::auxiliary::math::map_quat(out.pose.orientation) = e.x.q.cast<float>();
++		xrt::auxiliary::math::map_vec3(out.pose.position) = e.x.p.cast<float>();
++		xrt::auxiliary::math::map_vec3(out.linear_velocity) = e.x.v.cast<float>();
++		xrt::auxiliary::math::map_vec3(out.linear_acceleration) = e.world_accel.cast<float>();
++		xrt::auxiliary::math::map_vec3(out.angular_velocity) =
++		    (e.x.q.conjugate() * e.world_ang_vel).cast<float>();
++		for (int i = 0; i < 3; i++) {
++			out.position_variance[i] = e.P(ERR_POS + i, ERR_POS + i);
++		}
++		out.last_fix_ns = last_fix_ts_;
++		out.holding = holding(e.ts);
++		return true;
++	}
++
+ 	void
+ 	reset()
+ 	{
+@@ -796,6 +819,12 @@ rift_s_ctrl_fusion_get_relation(struct rift_s_ctrl_fusion *fusion,
+ 	return fusion->impl->get_relation(at_timestamp_ns, *out_relation);
+ }
+ 
++extern "C" bool
++rift_s_ctrl_fusion_get_newest_sample(const struct rift_s_ctrl_fusion *fusion, struct rift_s_ctrl_fusion_sample *out_sample)
++{
++	return fusion->impl->newest_sample(*out_sample);
++}
++
+ extern "C" bool
+ rift_s_ctrl_fusion_is_initialised(const struct rift_s_ctrl_fusion *fusion)
+ {
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+index bd4a592..4be97d3 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+@@ -163,6 +163,28 @@ rift_s_ctrl_fusion_get_relation(struct rift_s_ctrl_fusion *fusion,
+                                 int64_t at_timestamp_ns,
+                                 struct xrt_space_relation *out_relation);
+ 
++//! The filter state after the newest IMU sample, for the occlusion motion models.
++struct rift_s_ctrl_fusion_sample
++{
++	int64_t timestamp_ns;
++	//! IMU pose in the tracking frame
++	struct xrt_pose pose;
++	struct xrt_vec3 linear_velocity;
++	//! Gravity-free acceleration, world frame
++	struct xrt_vec3 linear_acceleration;
++	//! Bias-corrected angular rate, controller frame
++	struct xrt_vec3 angular_velocity;
++	//! Diagonal of the position covariance (m^2), world axes
++	double position_variance[3];
++	//! Exposure time of the newest accepted (or reset) optical fix
++	int64_t last_fix_ns;
++	//! Position held still and reported untracked (coast_max without a fix)
++	bool holding;
++};
++
++bool
++rift_s_ctrl_fusion_get_newest_sample(const struct rift_s_ctrl_fusion *fusion, struct rift_s_ctrl_fusion_sample *out_sample);
++
+ //! Whether the filter has been initialised from an optical pose.
+ bool
+ rift_s_ctrl_fusion_is_initialised(const struct rift_s_ctrl_fusion *fusion);
+-- 
+2.56.0
+

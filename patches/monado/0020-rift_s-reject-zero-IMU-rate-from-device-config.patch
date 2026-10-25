@@ -1,0 +1,31 @@
+From 780fcb5839b8c67836731317d05508e8b582b66b Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:58:03 +0300
+Subject: [PATCH 20/46] rift_s: reject zero IMU rate from device config
+
+rift_s_hmd_handle_report divides 1000000 by imu_hz; a zero rate from
+the device would crash with SIGFPE on the first HMD report.
+
+(cherry picked from commit 5ba88d5966e7cf14e768c477de45fb53d007dcbd)
+---
+ src/xrt/drivers/rift_s/rift_s_protocol.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_protocol.c b/src/xrt/drivers/rift_s/rift_s_protocol.c
+index e8fe28d..dabde2f 100644
+--- a/src/xrt/drivers/rift_s/rift_s_protocol.c
++++ b/src/xrt/drivers/rift_s/rift_s_protocol.c
+@@ -417,6 +417,10 @@ rift_s_read_imu_config_info(struct os_hid_device *hid, struct rift_s_imu_config_
+ 
+ 	*imu_config = *(struct rift_s_imu_config_info_t *)buf;
+ 
++	/* A zero rate would divide by zero in the HMD IMU timestamp math. */
++	if (imu_config->imu_hz == 0)
++		return -1;
++
+ 	return 0;
+ }
+ 
+-- 
+2.56.0
+

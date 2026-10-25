@@ -1,0 +1,39 @@
+From 96f757824950f2f2b88b02201a8c0dac87ad197f Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:57:59 +0300
+Subject: [PATCH 19/46] rift_s: validate inputs before dereferencing in report
+ parsers
+
+Both report parsers read buf[0] before any NULL/size check. Reject
+NULL buffers and empty packets first.
+
+(cherry picked from commit 0980d3c808af5b9d34d4e06688ac187ccb03dd4a)
+---
+ src/xrt/drivers/rift_s/rift_s_protocol.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_protocol.c b/src/xrt/drivers/rift_s/rift_s_protocol.c
+index d36152c..e8fe28d 100644
+--- a/src/xrt/drivers/rift_s/rift_s_protocol.c
++++ b/src/xrt/drivers/rift_s/rift_s_protocol.c
+@@ -38,7 +38,7 @@
+ bool
+ rift_s_parse_hmd_report(rift_s_hmd_report_t *report, const unsigned char *buf, int size)
+ {
+-	if (buf[0] != 0x65)
++	if (report == NULL || buf == NULL || size < 1 || buf[0] != 0x65)
+ 		return false;
+ 
+ 	if (size != 64 || size != sizeof(rift_s_hmd_report_t))
+@@ -54,7 +54,7 @@ rift_s_parse_controller_report(rift_s_controller_report_t *report, const unsigne
+ {
+ 	uint8_t avail;
+ 
+-	if (buf[0] != 0x67)
++	if (report == NULL || buf == NULL || size < 1 || buf[0] != 0x67)
+ 		return false;
+ 
+ 	if (size < 62) {
+-- 
+2.56.0
+

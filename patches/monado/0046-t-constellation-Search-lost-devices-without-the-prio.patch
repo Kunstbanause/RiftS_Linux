@@ -1,0 +1,199 @@
+From 6e6473518b996445baaa05548cc59f40b4a24aff Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:30:36 +0100
+Subject: [PATCH 46/46] t/constellation: Search lost devices without the prior
+ position bound
+
+The prior of a lost device is its last accepted pose (0014). After a wrong
+LED match is accepted, the real device is far from it; the full search
+only calls poses near the prior good (or > 6 LEDs anywhere), so it never
+found the device again: a daylight protocol recording had 570 failed full
+searches in 19 s with the controller in view (left hand, reach segment).
+
+After 0.5 s without an accepted pose (and the prior not tracked), the full
+search accepts results up to 2 m from the prior, with at least 5 matched
+LEDs. The fusion then re-initialises from them (reset_force_after, 1.5 s).
+CONSTELLATION_WIDE_SEARCH=0 disables it. Counted as long_wide in the
+tracker stats (status file, tracker recording).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s.c               |  2 +
+ src/xrt/drivers/rift_s/rift_s_tracker.c       |  6 +--
+ .../tracking/t_constellation_tracking.h       |  2 +
+ .../tracking/constellation/internal/sample.h  |  2 +
+ .../constellation/t_constellation_tracking.c  | 38 ++++++++++++++++++-
+ 5 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s.c b/src/xrt/drivers/rift_s/rift_s.c
+index fce309c..94335bb 100644
+--- a/src/xrt/drivers/rift_s/rift_s.c
++++ b/src/xrt/drivers/rift_s/rift_s.c
+@@ -893,8 +893,10 @@ write_status_file(struct rift_s_system *sys, timepoint_ns now)
+ 		fprintf(f,
+ 		        ", \"tracker\": {\"frames_received\": %" PRIu64 ", \"frames_processed\": %" PRIu64
+ 		        ", \"long_requested\": %" PRIu64 ", \"long_superseded\": %" PRIu64 ", \"long_run\": %" PRIu64
++		        ", \"long_wide\": %" PRIu64
+ 		        ", \"blob_ms\": %.2f, \"fast_ms\": %.2f, \"long_ms\": %.2f}",
+ 		        ts.frames_received, ts.frames_processed, ts.long_requested, ts.long_superseded, ts.long_run,
++		        ts.long_wide,
+ 		        ts.last_blob_ns / 1e6, ts.last_fast_ns / 1e6, ts.last_long_ns / 1e6);
+ 	}
+ 
+diff --git a/src/xrt/drivers/rift_s/rift_s_tracker.c b/src/xrt/drivers/rift_s/rift_s_tracker.c
+index e4fcba0..bcc7690 100644
+--- a/src/xrt/drivers/rift_s/rift_s_tracker.c
++++ b/src/xrt/drivers/rift_s/rift_s_tracker.c
+@@ -413,7 +413,7 @@ rift_s_create_constellation_tracker(struct rift_s_tracker *t, struct xrt_frame_c
+ 		} else {
+ 			fprintf(t->record_tracker,
+ 			        "frame_ns,arrival_ns,received,processed,long_requested,long_superseded,long_run,"
+-			        "blob_ms,fast_ms,long_ms,blobs0,blobs1,blobs2,blobs3,blobs4\n");
++			        "blob_ms,fast_ms,long_ms,blobs0,blobs1,blobs2,blobs3,blobs4,long_wide\n");
+ 			RIFT_S_INFO("Recording constellation tracker counters to %s", path);
+ 		}
+ 	}
+@@ -952,10 +952,10 @@ rift_s_tracker_push_controller_frameset(struct rift_s_tracker *t, uint64_t frame
+ 		}
+ 		fprintf(t->record_tracker,
+ 		        "%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+-		        ",%.2f,%.2f,%.2f,%d,%d,%d,%d,%d\n",
++		        ",%.2f,%.2f,%.2f,%d,%d,%d,%d,%d,%" PRIu64 "\n",
+ 		        frame_mono_ns, os_monotonic_get_ns(), st.frames_received, st.frames_processed, st.long_requested,
+ 		        st.long_superseded, st.long_run, st.last_blob_ns / 1e6, st.last_fast_ns / 1e6,
+-		        st.last_long_ns / 1e6, b[0], b[1], b[2], b[3], b[4]);
++		        st.last_long_ns / 1e6, b[0], b[1], b[2], b[3], b[4], st.long_wide);
+ 	}
+ }
+ 
+diff --git a/src/xrt/include/tracking/t_constellation_tracking.h b/src/xrt/include/tracking/t_constellation_tracking.h
+index cf09dd9..f7c26be 100644
+--- a/src/xrt/include/tracking/t_constellation_tracking.h
++++ b/src/xrt/include/tracking/t_constellation_tracking.h
+@@ -124,6 +124,8 @@ struct t_constellation_tracker_stats
+ 	uint64_t long_requested;
+ 	uint64_t long_superseded;
+ 	uint64_t long_run;
++	//! Device searches (per camera) without the prior position bound, for devices lost for a while
++	uint64_t long_wide;
+ 	//! Duration of the last blob extraction, fast analysis and full search (ns)
+ 	uint64_t last_blob_ns;
+ 	uint64_t last_fast_ns;
+diff --git a/src/xrt/tracking/constellation/internal/sample.h b/src/xrt/tracking/constellation/internal/sample.h
+index a9dbede..0c60f1e 100644
+--- a/src/xrt/tracking/constellation/internal/sample.h
++++ b/src/xrt/tracking/constellation/internal/sample.h
+@@ -41,6 +41,8 @@ struct tracking_sample_device_state
+ 	float gravity_error_rad; /* Gravity vector uncertainty in radians 0..M_PI */
+ 	/* The prior is a tracked pose (position tracked by the device's fusion), not a held guess */
+ 	bool prior_tracked;
++	/* Lost for a while: the full search does not need results near the prior position */
++	bool wide_search;
+ 
+ 	/* Last observed pose, in world space */
+ 	bool have_last_seen_pose;
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracking.c b/src/xrt/tracking/constellation/t_constellation_tracking.c
+index c5e1fd5..2cfa98d 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracking.c
++++ b/src/xrt/tracking/constellation/t_constellation_tracking.c
+@@ -31,10 +31,19 @@
+ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
+ //! Refine tracked priors and drop unrefined prior / last seen poses (0 = the original behaviour, for A/B tests)
+ DEBUG_GET_ONCE_BOOL_OPTION(ct_prior_refine, "CONSTELLATION_PRIOR_REFINE", true)
++DEBUG_GET_ONCE_BOOL_OPTION(ct_wide_search, "CONSTELLATION_WIDE_SEARCH", true)
+ 
+ #define MIN_ROT_ERROR DEG_TO_RAD(30)
+ #define MIN_POS_ERROR 0.10
+ 
++/* Lost devices: after this long without an accepted pose, the full search no longer needs the result near
++ * the prior position. The prior is then the last accepted pose; if that was a wrong LED match, the real
++ * device is far from it and a search bound to it never finds it (a 19 s lockout in a recording). */
++#define WIDE_SEARCH_AFTER_NS (500 * U_TIME_1MS_IN_NS)
++#define WIDE_SEARCH_POS_ERROR 2.0
++//! A result away from the prior must match at least this many LEDs
++#define WIDE_SEARCH_MIN_LEDS 5
++
+ #define CT_TRACE(c, ...) U_LOG_IFL_T(c->log_level, __VA_ARGS__)
+ #define CT_DEBUG(c, ...) U_LOG_IFL_D(c->log_level, __VA_ARGS__)
+ #define CT_INFO(c, ...) U_LOG_IFL_I(c->log_level, __VA_ARGS__)
+@@ -190,6 +199,8 @@ struct t_constellation_tracker
+ 
+ 	//! CONSTELLATION_PRIOR_REFINE
+ 	bool prior_refine;
++	//! CONSTELLATION_WIDE_SEARCH
++	bool wide_search;
+ 
+ 	//! Counters for t_constellation_tracker_get_stats, protected by stats_lock
+ 	struct os_mutex stats_lock;
+@@ -977,6 +988,15 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
+ 		    MIN_ROT_ERROR;
+ 		dev_state->gravity_error_rad = MIN_ROT_ERROR;
+ 
++		dev_state->wide_search =
++		    ct->prior_refine && ct->wide_search && !dev_state->prior_tracked &&
++		    (!device->have_last_seen_pose ||
++		     (int64_t)(sample->timestamp - device->last_seen_pose_ts) > (int64_t)WIDE_SEARCH_AFTER_NS);
++		if (dev_state->wide_search) {
++			dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
++			    WIDE_SEARCH_POS_ERROR;
++		}
++
+ 		dev_state->have_last_seen_pose = device->have_last_seen_pose;
+ 		dev_state->last_seen_pose = device->last_seen_pose;
+ 
+@@ -1123,6 +1143,7 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
+ 	CT_DEBUG(ct, "Starting long analysis of frame TS %" PRIu64, sample->timestamp);
+ 
+ 	bool dev_found[CONSTELLATION_MAX_DEVICES] = {0};
++	uint64_t wide_searches = 0;
+ 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
+ 		struct tracking_sample_frame *view = sample->views + view_id;
+ 		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
+@@ -1144,7 +1165,11 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
+ 			if (dev_state->found_device_pose)
+ 				continue; /* This device was already found. No need for a long search */
+ 
+-			CT_DEBUG(ct, "Doing full search for device %d in view %d", device->led_model.id, view_id);
++			CT_DEBUG(ct, "Doing %s full search for device %d in view %d", dev_state->wide_search ? "wide" : "a",
++			         device->led_model.id, view_id);
++			if (dev_state->wide_search) {
++				wide_searches++;
++			}
+ 
+ 			for (int pass = 0; pass < 2; pass++) {
+ 
+@@ -1171,6 +1196,10 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
+ 				        &view->cam_gravity_vector, dev_state->gravity_error_rad, &dev_state->score)) {
+ 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
+ 					         device->led_model.id, pass);
++					if (dev_state->wide_search &&
++					    dev_state->score.matched_blobs < WIDE_SEARCH_MIN_LEDS) {
++						continue; // too little evidence away from the prior, try the deep search
++					}
+ 					if (!submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
+ 					                        pass == 0 ? T_CONSTELLATION_POSE_FROM_SHALLOW_SEARCH
+ 					                                  : T_CONSTELLATION_POSE_FROM_DEEP_SEARCH)) {
+@@ -1183,6 +1212,12 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
+ 		}
+ 	}
+ 
++	if (wide_searches > 0) {
++		os_mutex_lock(&ct->stats_lock);
++		ct->stats.long_wide += wide_searches;
++		os_mutex_unlock(&ct->stats_lock);
++	}
++
+ 	for (int d = 0; d < sample->n_devices; d++) {
+ 		if (!dev_found[d]) {
+ 			// if a long analysis did not find the device at all, then we push that it has no brightness
+@@ -1338,6 +1373,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
+ 
+ 	ct->log_level = debug_get_log_option_ct_log();
+ 	ct->prior_refine = debug_get_bool_option_ct_prior_refine();
++	ct->wide_search = debug_get_bool_option_ct_wide_search();
+ 	ct->debug_draw_blob_tint = true;
+ 	ct->debug_draw_blob_ids = true;
+ 	ct->hmd_xdev = hmd_xdev;
+-- 
+2.56.0
+

@@ -1,0 +1,41 @@
+From e2c33cec34a7364bc57608c0d67df021c3dfa217 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:57:09 +0100
+Subject: [PATCH 40/46] d/rift_s: Destroy camera debug sinks, no destroy on an
+ uninitialised mutex
+
+Ported from lbgos/rift-s-linux e76388e9e (without the autoexposure part,
+which this tree does not have).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_camera.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_camera.c b/src/xrt/drivers/rift_s/rift_s_camera.c
+index 36076a5..070bbfe 100644
+--- a/src/xrt/drivers/rift_s/rift_s_camera.c
++++ b/src/xrt/drivers/rift_s/rift_s_camera.c
+@@ -178,7 +178,9 @@ rift_s_camera_create(struct xrt_prober *xp,
+ 
+ 	if (os_mutex_init(&cam->lock) != 0) {
+ 		RIFT_S_ERROR("Failed to init camera configuration mutex");
+-		goto cleanup;
++		// No destroy: the sinks and variables are not set up yet.
++		free(cam);
++		return NULL;
+ 	}
+ 
+ 	// Store the tracker
+@@ -277,6 +279,8 @@ void
+ rift_s_camera_destroy(struct rift_s_camera *cam)
+ {
+ 	u_var_remove_root(cam);
++	u_sink_debug_destroy(&cam->debug_sinks[0]);
++	u_sink_debug_destroy(&cam->debug_sinks[1]);
+ 	os_mutex_destroy(&cam->lock);
+ 	free(cam);
+ }
+-- 
+2.56.0
+

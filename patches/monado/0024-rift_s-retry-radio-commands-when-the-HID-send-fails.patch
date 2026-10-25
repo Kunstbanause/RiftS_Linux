@@ -1,0 +1,35 @@
+From ee34a312f0256d0db13bf3652c7cf9071d3da4b6 Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:58:22 +0300
+Subject: [PATCH 24/46] rift_s: retry radio commands when the HID send fails
+
+A failed send still marked the command pending, so the queue waited
+forever for a reply to a packet that never went out.
+
+(cherry picked from commit acf69cc8085fc88943483721366cbffc085e3e6a)
+---
+ src/xrt/drivers/rift_s/rift_s_radio.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_radio.c b/src/xrt/drivers/rift_s/rift_s_radio.c
+index 781a32a..be16901 100644
+--- a/src/xrt/drivers/rift_s/rift_s_radio.c
++++ b/src/xrt/drivers/rift_s/rift_s_radio.c
+@@ -64,7 +64,13 @@ rift_s_radio_update(rift_s_radio_state *state, struct os_hid_device *hid)
+ 			rift_s_radio_command *cmd = state->pending_commands;
+ 			rift_s_hmd_radio_command_t *pkt = &cmd->read_command;
+ 
+-			os_hid_set_feature(hid, (uint8_t *)pkt, sizeof(*pkt));
++			if (os_hid_set_feature(hid, (uint8_t *)pkt, sizeof(*pkt)) < 0) {
++				/* Leave the command queued so a transient failure retries
++				 * next update instead of wedging the queue on a reply
++				 * that will never arrive. */
++				RIFT_S_DEBUG("Failed to send controller radio command");
++				break;
++			}
+ 			// rift_s_hexdump_buffer ("ControllerFWSend", (unsigned char *)(pkt), sizeof(*pkt));
+ 			state->command_result_pending = true;
+ 		}
+-- 
+2.56.0
+

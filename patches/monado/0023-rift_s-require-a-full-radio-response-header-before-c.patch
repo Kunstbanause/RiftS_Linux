@@ -1,0 +1,35 @@
+From c792662ac80d7e7c8b84c090a8299b04df0c75d0 Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:58:18 +0300
+Subject: [PATCH 23/46] rift_s: require a full radio response header before
+ consuming it
+
+The completion path below asserts ret > 3, but a 2-3 byte read fell
+through and was consumed with an uninitialised busy flag. Bail on
+short reads to match.
+
+(cherry picked from commit 058bd2f4b6e637ff2f5c05900d545b72e10c0dd4)
+---
+ src/xrt/drivers/rift_s/rift_s_radio.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_radio.c b/src/xrt/drivers/rift_s/rift_s_radio.c
+index b4cfb81..781a32a 100644
+--- a/src/xrt/drivers/rift_s/rift_s_radio.c
++++ b/src/xrt/drivers/rift_s/rift_s_radio.c
+@@ -79,8 +79,10 @@ rift_s_radio_update(rift_s_radio_state *state, struct os_hid_device *hid)
+ 		 * has incremented */
+ 		int ret = get_radio_response_report(hid, &radio_response);
+ 
+-		if (ret < 2) {
+-			break; /* HID read failed - bail */
++		/* The busy flag and seqnum occupy the first three bytes; a shorter
++		 * read carries no usable fields (busy_flag would be uninitialised stack). */
++		if (ret < 4) {
++			break; /* HID read failed or short - bail */
+ 		}
+ 
+ 		if (radio_response.busy_flag != 0x00 || radio_response.seqnum == state->last_radio_seqnum) {
+-- 
+2.56.0
+

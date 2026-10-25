@@ -1,0 +1,51 @@
+From 89c1afaced3f2b023b2bd639a8a549312daa92be Mon Sep 17 00:00:00 2001
+From: lbgos <285507185+lbgos@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:58:53 +0300
+Subject: [PATCH 28/46] rift_s: guard camera JSON model strings against
+ non-string values
+
+A present-but-non-string Id/Model made GetStringValue return NULL
+into strtol/strcmp. Reject it as a parse failure instead.
+
+(cherry picked from commit 9becb096bcfc6ad982df51638f80d6dddd180202)
+---
+ src/xrt/drivers/rift_s/rift_s_firmware.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_firmware.c b/src/xrt/drivers/rift_s/rift_s_firmware.c
+index 76cd536..9e7a865 100644
+--- a/src/xrt/drivers/rift_s/rift_s_firmware.c
++++ b/src/xrt/drivers/rift_s/rift_s_firmware.c
+@@ -176,7 +176,8 @@ rift_s_config_parse_camera_config(struct rift_s_camera_calibration *cam_config,
+ 	int id = -1;
+ 
+ 	item = u_json_get(camera_json, "Id");
+-	if (item == NULL || (id = strtol(cJSON_GetStringValue(item), NULL, 10)) != camera_id) {
++	const char *id_str = cJSON_GetStringValue(item);
++	if (id_str == NULL || (id = strtol(id_str, NULL, 10)) != camera_id) {
+ 		RIFT_S_ERROR("Camera entry id %d doesn't match expected %d", id, camera_id);
+ 		return false;
+ 	}
+@@ -206,7 +207,8 @@ rift_s_config_parse_camera_config(struct rift_s_camera_calibration *cam_config,
+ 
+ 	obj = u_json_get(camera_json, "Projection");
+ 	item = u_json_get(obj, "Model");
+-	if (item == NULL || strcmp(cJSON_GetStringValue(item), "PinholeSymmetric") != 0) {
++	const char *projection_model = cJSON_GetStringValue(item);
++	if (projection_model == NULL || strcmp(projection_model, "PinholeSymmetric") != 0) {
+ 		RIFT_S_ERROR("Missing/invalid camera projection model type %s in camera %d",
+ 		             item != NULL ? cJSON_GetStringValue(item) : "NULL", camera_id);
+ 		return false;
+@@ -228,7 +230,8 @@ rift_s_config_parse_camera_config(struct rift_s_camera_calibration *cam_config,
+ 	/* Fisheye62 distortion */
+ 	obj = u_json_get(camera_json, "Distortion");
+ 	item = u_json_get(obj, "Model");
+-	if (item == NULL || strcmp(cJSON_GetStringValue(item), "Fisheye62") != 0) {
++	const char *distortion_model = cJSON_GetStringValue(item);
++	if (distortion_model == NULL || strcmp(distortion_model, "Fisheye62") != 0) {
+ 		RIFT_S_ERROR("Missing/invalid camera distortion model type %s in camera %d",
+ 		             item != NULL ? cJSON_GetStringValue(item) : "NULL", camera_id);
+ 		return false;
+-- 
+2.56.0
+

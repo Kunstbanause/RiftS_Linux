@@ -1,0 +1,54 @@
+From c6c6d2f90d589970452ebb000534f6bb4905ac64 Mon Sep 17 00:00:00 2001
+From: Ryan Ford <ryan@ryanford.ca>
+Date: Thu, 15 Oct 2026 17:47:02 -0400
+Subject: [PATCH 39/46] rift_s: resync camera frame time after a clock
+ discontinuity
+
+IMU samples are ignored until the first SLAM frame is accepted, so the
+first frame's epoch offset is computed against an IMU timestamp of 0.
+When the extended IMU clock is a 2^32 us epoch ahead of the camera
+clock, that frame maps to a negative monotonic time and is rejected as
+"went backward". last_frame_time then stays 0, IMU stays ignored, the
+epoch offset is never corrected, and every following frame is rejected
+too: no head tracking, an empty grey Room View in Room Setup.
+
+Seen on 8 of 8 starts on one headset, e.g.:
+  frame_ts=1625067443000 imu_ts=0 hw2mono=-3395444712931
+  -> mono=-1770377269931 (now=2524604154978)
+with the IMU clock at 5920 s vs the camera at 1625 s once IMU ran.
+
+Treat a backward step of more than a second as a discontinuity and
+accept the frame. It is not fresh, so it is not submitted to SLAM, but
+it ungates IMU; the next frame gets the correct epoch offset and maps
+to ~now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit e9a098e31308dbf04ca913f653b7cd4a33c286d6)
+---
+ src/xrt/drivers/rift_s/rift_s_tracker.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_tracker.c b/src/xrt/drivers/rift_s/rift_s_tracker.c
+index 6ac51bb..89a8798 100644
+--- a/src/xrt/drivers/rift_s/rift_s_tracker.c
++++ b/src/xrt/drivers/rift_s/rift_s_tracker.c
+@@ -869,7 +869,15 @@ rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
+ 
+ 
+ 	timepoint_ns frame_mono_ns = raw_frame_ts_to_mono_ts(t, frame_ts_ns);
+-	if (frame_mono_ns < t->last_frame_time) {
++	if (t->last_frame_time - frame_mono_ns > (timepoint_ns)U_TIME_1S_IN_NS) {
++		/* A clock discontinuity, not jitter. At startup IMU samples are ignored until the
++		 * first frame is accepted, so the first frame's epoch offset is computed without
++		 * IMU time; when the IMU clock is a 2^32 us epoch ahead that frame maps far into
++		 * the past (or before 0). Rejecting it would keep last_frame_time at 0, keep IMU
++		 * ignored and the epoch uncorrected, so every later frame would be rejected too. */
++		RIFT_S_WARN("Camera clock discontinuity of %" PRId64 " ns; resyncing frame time",
++		            frame_mono_ns - t->last_frame_time);
++	} else if (frame_mono_ns < t->last_frame_time) {
+ 		RIFT_S_WARN("Camera frame time went backward by %" PRId64 " ns", frame_mono_ns - t->last_frame_time);
+ 		os_mutex_unlock(&t->mutex);
+ 		return;
+-- 
+2.56.0
+

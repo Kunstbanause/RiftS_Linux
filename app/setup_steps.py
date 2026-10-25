@@ -7,8 +7,8 @@ Usage: rift-s-linux setup                       state of every step
 
 The GUI's Setup tab runs the same steps. Rules:
 - Everything is built / unpacked into the user's home (~/.local/opt, ~/.local/share/rift-s-linux).
-- Only three things need root, each asked for with pkexec: Fedora packages (build dependencies,
-  udev rules, Basalt), and setcap on monado-service.
+- Only two things need root, each asked for with pkexec: Fedora packages (build dependencies,
+  udev rules, Fedora's Basalt as a fallback), and setcap on monado-service.
 - Before installing packages, dnf is asked what it would do; upgrades of desktop / graphics
   packages (Qt, KDE, Mesa, ...) are shown and need an explicit "install anyway".
 - Config files that already exist are backed up before they are replaced; uninstall restores them.
@@ -44,9 +44,10 @@ BUILD_PACKAGES = [
     "pkgconfig(sdl2)", "pkgconfig(wayland-client)", "pkgconfig(wayland-protocols)",
     "pkgconfig(wayland-scanner)", "pkgconfig(xrandr)", "pkgconfig(egl)", "pkgconfig(gl)",
     "pkgconfig(dri)", "pkgconfig(zlib)",
+    "pkgconfig(tbb)", "pkgconfig(fmt)",   # Basalt
 ]
 RUNTIME_PACKAGES = [
-    "basalt-monado",      # SLAM head tracking (loaded at runtime via VIT_SYSTEM_LIBRARY_PATH)
+    "basalt-monado",      # SLAM head tracking, fallback for the patched build (VIT_SYSTEM_LIBRARY_PATH)
     "xr-hardware",        # udev rules: lets your user open the headset's USB / hidraw devices
     "openxr-libs",        # OpenXR loader
     "libcap",             # setcap / getcap
@@ -465,6 +466,73 @@ class PackagesStep(Step):
         ctx.manifest.add("packages", installs)
 
 
+def build_jobs(gb_per_job, max_jobs):
+    """Parallel compile jobs that fit in the memory free right now (not the total: the desktop, a browser
+    or a game need theirs). Basalt's template-heavy files take several GB each; 7 jobs on a 30 GB laptop
+    ran it out of memory."""
+    try:
+        avail_kb = next(int(ln.split()[1]) for ln in open("/proc/meminfo") if ln.startswith("MemAvailable"))
+    except (OSError, StopIteration, ValueError):
+        return 1
+    return max(1, min(os.cpu_count() or 1, max_jobs, int(avail_kb / 1024 / 1024 / gb_per_job)))
+
+
+class BasaltStep(Step):
+    key = "basalt"
+    redo = "Rebuild"
+    title = "Basalt (head tracking)"
+    about = ("Basalt SLAM at the commit Fedora packages, plus patches/basalt from lbgos/rift-s-linux: "
+             "about half the CPU, no ever-growing memory, a short camera queue. Built into "
+             "~/.local/opt/basalt-rifts; Fedora's basalt-monado stays the fallback.")
+    duration = "10-30 min"
+    marker = BASALT / "rift-s-linux.json"
+
+    def wanted(self):
+        v = VERSIONS["basalt"]
+        return {"commit": v["commit"], "patches": files_hash(PATCHES / "basalt")}
+
+    def check(self):
+        if not BASALT_LIB.exists():
+            return State(MISSING, "Not built", ["Until then Monado uses Fedora's basalt-monado."])
+        if read_json(self.marker) != self.wanted():
+            return State(OUTDATED, "Update available", ["The repo has newer Basalt patches than the build."])
+        return State(OK, f"{VERSIONS['basalt']['commit'][:7]} + "
+                         f"{len(list((PATCHES / 'basalt').glob('*.patch')))} patches")
+
+    def install(self, ctx):
+        need_tools("git", "cmake", "ninja")
+        v = VERSIONS["basalt"]
+        src, build = SRC / "basalt", SRC / "basalt-build"
+        git_checkout(ctx, src, v["repo"], v["commit"])
+        try:
+            ctx.run(["git", "submodule", "update", "--init", "--recursive", "--depth", "1", "--jobs", "4"],
+                    cwd=src, timeout=3600)
+        except StepFailed:
+            ctx.log("Shallow submodule fetch failed, fetching them in full")
+            ctx.run(["git", "submodule", "update", "--init", "--recursive", "--jobs", "4"], cwd=src, timeout=3600)
+        patches = sorted((PATCHES / "basalt").glob("*.patch"))
+        ctx.log(f"Applying {len(patches)} patches")
+        ctx.run(["git", "apply", *patches], cwd=src)
+        if not BASALT.exists():
+            ctx.manifest.created_dir(BASALT)
+        # Fedora's spec flags; the bundled cereal (Fedora's cereal package lacks the target Basalt wants)
+        ctx.run(["cmake", "-S", src, "-B", build, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                 f"-DCMAKE_INSTALL_PREFIX={BASALT}", "-DCMAKE_INSTALL_LIBDIR=lib64",
+                 "-DBASALT_BUILTIN_EIGEN=OFF", "-DEIGEN_ROOT=/usr/include/eigen3", "-DBASALT_BUILTIN_CEREAL=ON",
+                 "-DSKIP_PERFORMANCE_COMPARISON=ON", "-DBUILD_SANDBOX=OFF", "-DBUILD_DOC=OFF",
+                 "-DBASALT_BUILD_SHARED_LIBRARY_ONLY=ON", "-DBASALT_BUILD_TESTS=OFF", "-DBUILD_TESTS=OFF",
+                 "-DBUILD_TESTING=OFF", "-DBASALT_BUILD_VISUALIZATION=OFF", "-DBASALT_ENABLE_ROSBAG2=OFF",
+                 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"])
+        jobs = build_jobs(8, 3)
+        ctx.log(f"Building Basalt with {jobs} parallel jobs (memory-heavy, takes a while; progress below)")
+        ctx.run(["ninja", "-C", build, f"-j{jobs}"], timeout=7200)
+        ctx.run(["ninja", "-C", build, "install"])
+        if not BASALT_LIB.exists():
+            raise StepFailed(f"build finished but {BASALT_LIB} is missing")
+        self.marker.write_text(json.dumps(self.wanted()) + "\n")
+        ctx.log("Basalt installed. 'Connect everything' switches Monado to it.")
+
+
 class MonadoStep(Step):
     key = "monado"
     redo = "Rebuild"
@@ -632,6 +700,40 @@ def conf_env(text):
 
 
 REQUIRED_ENV = ("VIT_SYSTEM_LIBRARY_PATH", "RIFT_S_HANDTRACKING")
+# BASALT_LIB as rift-s.conf writes it (systemd expands %h)
+BASALT_CONF_VALUE = "%h/.local/opt/basalt-rifts/lib64/libbasalt.so.2"
+
+
+def expand_h(value):
+    """systemd's %h (home directory) in a rift-s.conf value."""
+    return value.replace("%h", str(HOME))
+
+
+def basalt_value():
+    """VIT_SYSTEM_LIBRARY_PATH to write: the patched Basalt once built, else Fedora's."""
+    return BASALT_CONF_VALUE if BASALT_LIB.exists() else str(FEDORA_BASALT_LIB)
+
+
+def conf_migrations(text):
+    """rift-s.conf lines to replace on a re-run: install paths that changed, and settings still at an old
+    default that has a better one now. Values you changed yourself are never touched.
+    Returns [(old line, new line, reason)]."""
+    out = []
+    env = conf_env(text)
+    for ln in text.splitlines():
+        m = re.match(r'\s*Environment="?([A-Za-z0-9_]+)=(.*?)"?\s*$', ln)
+        if not m:
+            continue
+        key, val = m.groups()
+        if key == "VIT_SYSTEM_LIBRARY_PATH" and val in (str(FEDORA_BASALT_LIB), BASALT_CONF_VALUE):
+            want = basalt_value()
+            if val != want:
+                out.append((ln, f'Environment="VIT_SYSTEM_LIBRARY_PATH={want}"',
+                            "head tracking uses the patched Basalt" if BASALT_LIB.exists()
+                            else "patched Basalt missing: back to Fedora's"))
+        if key == "RIFT_S_DISTORTION_C1" and val == "0.47" and "RIFT_S_DISTORTION" not in env:
+            out.append((ln, 'Environment="RIFT_S_DISTORTION=mesh"', "lens: the mesh model (patch 0017) replaces c1 = 0.47"))
+    return out
 
 
 class ConfigStep(Step):
@@ -660,9 +762,12 @@ class ConfigStep(Step):
             for path, content in units:
                 if not path.exists() or path.read_text(errors="replace") != content:
                     p.append(f"{path.name} not installed")
-        env = conf_env(RIFT_S_CONF.read_text()) if RIFT_S_CONF.exists() else {}
+        text = RIFT_S_CONF.read_text() if RIFT_S_CONF.exists() else ""
+        env = conf_env(text)
         if any(k not in env for k in REQUIRED_ENV):
             p.append("Monado settings (rift-s.conf) missing or incomplete")
+        for _old, _new, why in conf_migrations(text):
+            p.append(f"rift-s.conf update: {why}")
         for rel in ("wayvr.service", "wayvr.service.d/50-stop.conf"):
             if not (SYSTEMD_USER / rel).exists():
                 p.append(f"{rel} not installed")
@@ -701,15 +806,22 @@ class ConfigStep(Step):
         # rift-s.conf: written once; later runs only add missing required settings and never change
         # values that are there (your tuning from the GUI's Tools tab stays)
         tmpl = (CONFIG / "systemd/monado.service.d/rift-s.conf").read_text()
+        tmpl = tmpl.replace(f'VIT_SYSTEM_LIBRARY_PATH={BASALT_CONF_VALUE}', f'VIT_SYSTEM_LIBRARY_PATH={basalt_value()}')
         if RIFT_S_CONF.exists():
             cur = RIFT_S_CONF.read_text()
-            have = conf_env(cur)
+            new = cur
+            for old, repl, why in conf_migrations(cur):
+                new = new.replace(old, repl, 1)
+                ctx.log(f"rift-s.conf: {why}")
+            have = conf_env(new)
             add = [ln for ln in tmpl.splitlines()
                    if (m := re.match(r'\s*Environment="?([A-Za-z0-9_]+)=', ln))
                    and m.group(1) in REQUIRED_ENV and m.group(1) not in have]
             if add:
-                write_file(man, RIFT_S_CONF, cur.rstrip("\n") + "\n" + "\n".join(add) + "\n")
+                new = new.rstrip("\n") + "\n" + "\n".join(add) + "\n"
                 ctx.log("rift-s.conf: added " + ", ".join(conf_env("\n".join(add))))
+            if new != cur:
+                write_file(man, RIFT_S_CONF, new)
         else:
             write_file(man, RIFT_S_CONF, tmpl)
         write_file(man, WAYVR_UNIT, (CONFIG / "systemd/wayvr.service").read_text())
@@ -767,7 +879,7 @@ class ToolsStep(Step):
             ctx.run(["gcc", "-O1", "-Wall", TOOLS / f"{name}.c", "-o", BIN / name, "-lopenxr_loader", *libs])
 
 
-STEPS = [SystemStep(), PackagesStep(), MonadoStep(), SetcapStep(), XrizerStep(), WayVRStep(),
+STEPS = [SystemStep(), PackagesStep(), BasaltStep(), MonadoStep(), SetcapStep(), XrizerStep(), WayVRStep(),
          ConfigStep(), ToolsStep()]
 
 

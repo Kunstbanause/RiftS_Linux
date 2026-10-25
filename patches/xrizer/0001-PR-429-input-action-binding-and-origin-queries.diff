@@ -1,0 +1,1267 @@
+xrizer PR #429 by nokichan (https://github.com/Supreeeme/xrizer/pull/429, head 7d77c83),
+"input: implement action binding and origin queries", as a plain diff against main 0519ded.
+Fixes the Half-Life: Alyx level-load hang (xrizer#435). Applied with git apply by the setup.
+
+diff --git a/src/input.rs b/src/input.rs
+index 4fe2507..9842b36 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -44,6 +44,42 @@ new_key_type! {
+     struct ActionSetKey;
+ }
+ 
++/// Normalize OpenXR component names to their OpenVR equivalents.
++fn normalize_component(name: &str) -> &str {
++    match name {
++        "thumbstick" => "joystick",
++        "squeeze" => "grip",
++        _ => name,
++    }
++}
++
++/// Parse an OpenXR path into (device_path, input_kind, component, slot).
++/// e.g. "/user/hand/right/input/trigger/value" → ("/user/hand/right", "input", "trigger", "value")
++fn parse_input_path(path: &str) -> (&str, &str, &str, &str) {
++    for kind in ["input", "output"] {
++        let needle = format!("/{kind}/");
++        if let Some(pos) = path.find(&needle) {
++            let device = &path[..pos];
++            let after = &path[pos + needle.len()..];
++            let mut parts = after.splitn(2, '/');
++            let comp = parts.next().unwrap_or("");
++            let slot = parts.next().unwrap_or("");
++            return (device, kind, comp, slot);
++        }
++    }
++    ("", "", "", "")
++}
++
++/// Copy a string into a fixed-size `c_char` buffer with null terminator.
++fn copy_cstr(dst: &mut [c_char], s: &str) {
++    let bytes = s.as_bytes();
++    let n = bytes.len().min(dst.len() - 1);
++    for (d, &b) in dst.iter_mut().zip(bytes[..n].iter()) {
++        *d = b as c_char;
++    }
++    dst[n] = 0;
++}
++
+ #[derive(macros::InterfaceImpl)]
+ #[interface = "IVRInput"]
+ #[versions(011, 010, 007, 006, 005, 004)]
+@@ -149,12 +185,144 @@ impl<C: openxr_data::Compositor> Input<C> {
+         if handle == vr::k_ulInvalidInputValueHandle {
+             Some(xr::Path::NULL)
+         } else {
+-            match InputSourceKey::from(KeyData::from_ffi(handle)) {
+-                x if x == self.left_hand_key => Some(self.get_subaction_path(Hand::Left)),
+-                x if x == self.right_hand_key => Some(self.get_subaction_path(Hand::Right)),
+-                _ => None,
++            let key = InputSourceKey::from(KeyData::from_ffi(handle));
++            self.hand_from_key(key)
++                .map(|hand| self.get_subaction_path(hand))
++        }
++    }
++
++    /// Determine which hand an input source key belongs to, including
++    /// specific input paths like `/user/hand/right/input/trigger`.
++    fn hand_from_key(&self, key: InputSourceKey) -> Option<Hand> {
++        if key == self.left_hand_key {
++            return Some(Hand::Left);
++        }
++        if key == self.right_hand_key {
++            return Some(Hand::Right);
++        }
++        let map = self.input_source_map.read().unwrap();
++        map.get(key).and_then(|path| {
++            let s = path.to_string_lossy();
++            if s.starts_with("/user/hand/left") {
++                Some(Hand::Left)
++            } else if s.starts_with("/user/hand/right") {
++                Some(Hand::Right)
++            } else {
++                None
++            }
++        })
++    }
++
++    /// Get or create a handle for a specific input source path
++    /// (e.g., `/user/hand/right/input/trigger/click`).
++    fn get_or_create_input_source_handle(&self, path_str: &str) -> u64 {
++        let c_path = CString::new(path_str).unwrap();
++        {
++            let guard = self.input_source_map.read().unwrap();
++            if let Some((key, _)) = guard
++                .iter()
++                .find(|(_, src)| src.as_c_str() == c_path.as_c_str())
++            {
++                return key.data().as_ffi();
+             }
+         }
++        let mut guard = self.input_source_map.write().unwrap();
++        if let Some((key, _)) = guard
++            .iter()
++            .find(|(_, src)| src.as_c_str() == c_path.as_c_str())
++        {
++            key.data().as_ffi()
++        } else {
++            let key = guard.insert(c_path);
++            key.data().as_ffi()
++        }
++    }
++
++    /// Collect all action keys that share the same input suffix across
++    /// `_left` / `_right` / base action set variants.
++    fn related_action_keys(&self, action_key: ActionKey) -> Vec<ActionKey> {
++        let guard = self.action_map.read().unwrap();
++        let mut keys = vec![action_key];
++        let action_path = guard
++            .get(action_key)
++            .map(|a| a.path.clone())
++            .unwrap_or_default();
++
++        if !action_path.is_empty()
++            && let Some((set_part, input_part)) = action_path.split_once("/in/")
++        {
++            let suffix = format!("/in/{input_part}");
++            let set_candidates: Vec<String> = if let Some(base) = set_part.strip_suffix("_left") {
++                vec![base.to_string(), format!("{base}_right")]
++            } else if let Some(base) = set_part.strip_suffix("_right") {
++                vec![base.to_string(), format!("{base}_left")]
++            } else {
++                vec![format!("{set_part}_left"), format!("{set_part}_right")]
++            };
++
++            for set_candidate in set_candidates {
++                let candidate = format!("{set_candidate}{suffix}");
++                if let Some((key, _)) = guard.iter().find(|(_, a)| a.path == candidate)
++                    && !keys.contains(&key)
++                {
++                    keys.push(key);
++                }
++            }
++        }
++
++        keys
++    }
++
++    /// Resolve the currently active interaction profile, preferring the
++    /// runtime-reported profile over the profile with the most bindings.
++    /// Returns `None` only when no profile is known at all.
++    fn resolve_active_profile(
++        &self,
++        session_data: &openxr_data::SessionData,
++        loaded: &ManifestLoadedActions,
++    ) -> Option<xr::Path> {
++        let runtime_profile = {
++            let devices = session_data.input_data.devices.read().unwrap();
++            [Hand::Left, Hand::Right].into_iter().find_map(|h| {
++                devices
++                    .get_controller(h)
++                    .map(|dev| dev.profile_path)
++                    .filter(|p| *p != xr::Path::NULL)
++            })
++        }
++        .or_else(|| {
++            [Hand::Left, Hand::Right].into_iter().find_map(|h| {
++                session_data
++                    .session
++                    .current_interaction_profile(self.get_subaction_path(h))
++                    .ok()
++                    .filter(|p| *p != xr::Path::NULL)
++            })
++        });
++
++        let simple_profile = self
++            .openxr
++            .instance
++            .string_to_path("/interaction_profiles/khr/simple_controller")
++            .ok();
++
++        let is_simple = |p: xr::Path| simple_profile.map(|sp| p == sp).unwrap_or(false);
++
++        let preferred_profile = loaded
++            .per_profile_input_paths
++            .iter()
++            .max_by_key(|(profile, map)| {
++                let total_paths: usize = map.values().map(Vec::len).sum();
++                let is_non_simple = simple_profile.map(|sp| **profile != sp).unwrap_or(true);
++                (is_non_simple as usize, total_paths)
++            })
++            .map(|(p, _)| *p);
++
++        match runtime_profile {
++            Some(profile) if !is_simple(profile) => Some(profile),
++            Some(_) => preferred_profile.or(runtime_profile),
++            None => preferred_profile,
++        }
+     }
+ 
+     fn state_from_bindings_left_right(
+@@ -381,7 +549,8 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
+         _: u32,
+         _: *mut vr::RenderModel_ComponentState_t,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("GetComponentStateForBinding");
++        vr::EVRInputError::None
+     }
+     fn ShowBindingsForActionSet(
+         &self,
+@@ -390,27 +559,178 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
+         _: u32,
+         _: vr::VRInputValueHandle_t,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("ShowBindingsForActionSet");
++        vr::EVRInputError::None
+     }
+     fn ShowActionOrigins(
+         &self,
+         _: vr::VRActionSetHandle_t,
+         _: vr::VRActionHandle_t,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("ShowActionOrigins");
++        vr::EVRInputError::None
+     }
+     fn GetActionBindingInfo(
+         &self,
+-        _: vr::VRActionHandle_t,
+-        _: *mut vr::InputBindingInfo_t,
+-        _: u32,
+-        _: u32,
++        action_handle: vr::VRActionHandle_t,
++        binding_info: *mut vr::InputBindingInfo_t,
++        binding_info_size: u32,
++        binding_info_count: u32,
+         returned_binding_info_count: *mut u32,
+     ) -> vr::EVRInputError {
+-        crate::warn_unimplemented!("GetActionBindingInfo");
++        let session_data = self.openxr.session_data.get();
++        let Some(loaded) = session_data.input_data.get_loaded_actions() else {
++            if !returned_binding_info_count.is_null() {
++                unsafe { *returned_binding_info_count = 0 };
++            }
++            return vr::EVRInputError::InvalidHandle;
++        };
++
++        let action_key = ActionKey::from(KeyData::from_ffi(action_handle));
++        if !loaded.actions.contains_key(action_key) {
++            // Action handle is valid (from GetActionHandle) but has no loaded bindings.
++            // Return 0 bindings with None error instead of InvalidHandle, matching SteamVR behavior.
++            if !returned_binding_info_count.is_null() {
++                unsafe { *returned_binding_info_count = 0 };
++            }
++            let guard = self.action_map.read().unwrap();
++            if guard.contains_key(action_key) {
++                return vr::EVRInputError::None;
++            }
++            return vr::EVRInputError::InvalidHandle;
++        }
++
++        let related_action_keys = self.related_action_keys(action_key);
++
++        let active_profile = self.resolve_active_profile(&session_data, loaded);
++
++        let paths_for_profile = |profile: xr::Path| -> Vec<xr::Path> {
++            let mut out = Vec::new();
++            let mut seen = HashSet::new();
++            if let Some(map) = loaded.per_profile_input_paths.get(&profile) {
++                for key in &related_action_keys {
++                    if let Some(paths) = map.get(*key) {
++                        for &p in paths {
++                            if seen.insert(p) {
++                                out.push(p);
++                            }
++                        }
++                    }
++                }
++            }
++            out
++        };
++
++        let paths: Vec<xr::Path> = if let Some(p) = active_profile {
++            paths_for_profile(p)
++        } else {
++            let mut seen = HashSet::new();
++            loaded
++                .per_profile_input_paths
++                .values()
++                .flat_map(|m| {
++                    related_action_keys
++                        .iter()
++                        .flat_map(|key| m.get(*key).into_iter().flatten().copied::<xr::Path>())
++                })
++                .filter(|p| seen.insert(*p))
++                .collect()
++        };
++
++        if binding_info.is_null() || binding_info_count == 0 {
++            if !returned_binding_info_count.is_null() {
++                unsafe { *returned_binding_info_count = paths.len() as u32 };
++            }
++            return vr::EVRInputError::None;
++        }
++
++        if binding_info_size as usize != std::mem::size_of::<vr::InputBindingInfo_t>() {
++            if !returned_binding_info_count.is_null() {
++                unsafe { *returned_binding_info_count = 0 };
++            }
++            return vr::EVRInputError::InvalidParam;
++        }
++
++        let count = paths.len().min(binding_info_count as usize);
+         if !returned_binding_info_count.is_null() {
+-            unsafe { *returned_binding_info_count = 0 };
++            unsafe { *returned_binding_info_count = count as u32 };
+         }
++
++        let infos =
++            unsafe { std::slice::from_raw_parts_mut(binding_info, binding_info_count as usize) };
++
++        let action_is_bool = matches!(loaded.actions.get(action_key), Some(ActionData::Bool(_)));
++        let action_name = self
++            .action_map
++            .read()
++            .unwrap()
++            .get(action_key)
++            .map(|a| a.path.clone())
++            .unwrap_or_default();
++
++        for (i, &xr_path) in paths.iter().take(count).enumerate() {
++            let info = &mut infos[i];
++            *info = unsafe { std::mem::zeroed() };
++
++            let input_path_str = self
++                .openxr
++                .instance
++                .path_to_string(xr_path)
++                .unwrap_or_default();
++
++            let (device_path, input_kind, component, slot_raw) = parse_input_path(&input_path_str);
++
++            let slot = if slot_raw.is_empty() {
++                match component {
++                    "thumbstick" | "joystick" | "trackpad" => "position",
++                    _ => "",
++                }
++            } else {
++                slot_raw
++            };
++
++            let slot = if action_is_bool
++                && slot == "value"
++                && matches!(component, "trigger" | "squeeze" | "grip")
++            {
++                "click"
++            } else {
++                slot
++            };
++
++            let display_component = normalize_component(component);
++
++            let input_component_path = if input_kind.is_empty() || display_component.is_empty() {
++                String::new()
++            } else {
++                format!("/{input_kind}/{display_component}")
++            };
++            copy_cstr(&mut info.rchInputPathName, &input_component_path);
++
++            // SteamVR's touch_profile.json lists grip as type "trigger"
++            let mode_name = match display_component {
++                "trackpad" => "trackpad",
++                "joystick" => "joystick",
++                "trigger" | "grip" => "trigger",
++                _ => "button",
++            };
++            copy_cstr(&mut info.rchModeName, mode_name);
++
++            copy_cstr(&mut info.rchSlotName, slot);
++
++            copy_cstr(&mut info.rchDevicePathName, device_path);
++
++            copy_cstr(&mut info.rchInputSourceType, mode_name);
++
++            debug!(
++                "GetActionBindingInfo: action={action_name:?} raw={input_path_str} device={device_path} input={input_component_path} mode={mode_name} slot={slot}"
++            );
++        }
++
++        debug!(
++            "GetActionBindingInfo: action {action_name:?} → {count} binding(s) (related_actions={})",
++            related_action_keys.len(),
++        );
+         vr::EVRInputError::None
+     }
+     fn GetOriginTrackedDeviceInfo(
+@@ -419,22 +739,39 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
+         info: *mut vr::InputOriginInfo_t,
+         info_size: u32,
+     ) -> vr::EVRInputError {
+-        assert_eq!(
+-            info_size as usize,
+-            std::mem::size_of::<vr::InputOriginInfo_t>()
+-        );
++        if info.is_null() {
++            return vr::EVRInputError::InvalidParam;
++        }
++        if info_size as usize != std::mem::size_of::<vr::InputOriginInfo_t>() {
++            warn!(
++                "GetOriginTrackedDeviceInfo: unexpected info_size {}, expected {}",
++                info_size,
++                std::mem::size_of::<vr::InputOriginInfo_t>()
++            );
++        }
+ 
+         let key = InputSourceKey::from(KeyData::from_ffi(handle));
+-        let map = self.input_source_map.read().unwrap();
+-        if !map.contains_key(key) {
+-            return vr::EVRInputError::InvalidHandle;
+-        }
++        let source_path = {
++            let map = self.input_source_map.read().unwrap();
++            if !map.contains_key(key) {
++                debug!("GetOriginTrackedDeviceInfo: invalid handle 0x{:x}", handle);
++                unsafe {
++                    info.write(Default::default());
++                }
++                return vr::EVRInputError::InvalidHandle;
++            }
++            map.get(key)
++                .map(|s| s.to_string_lossy().to_string())
++                .unwrap_or_default()
++        };
+ 
+-        // Superhot needs this device index to render controllers.
+-        let index = match key {
+-            x if x == self.left_hand_key => Hand::Left as u32,
+-            x if x == self.right_hand_key => Hand::Right as u32,
+-            _ => {
++        let index = match self.hand_from_key(key) {
++            Some(hand) => hand as u32,
++            None => {
++                debug!(
++                    "GetOriginTrackedDeviceInfo: unknown device for handle 0x{:x} path={}",
++                    handle, source_path
++                );
+                 unsafe {
+                     info.write(Default::default());
+                 }
+@@ -442,33 +779,277 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
+             }
+         };
+ 
++        let (_, _, raw_component, _) = parse_input_path(&source_path);
++        let component_name = normalize_component(raw_component);
++
++        let mut render_model_component: [c_char; 128] = [0; 128];
++        copy_cstr(&mut render_model_component, component_name);
++
++        debug!(
++            "GetOriginTrackedDeviceInfo: handle=0x{:x} path={} index={} component={}",
++            handle, source_path, index, component_name
++        );
++
+         unsafe {
+-            *info.as_mut().unwrap() = vr::InputOriginInfo_t {
++            *info = vr::InputOriginInfo_t {
+                 devicePath: handle,
+                 trackedDeviceIndex: index,
+-                rchRenderModelComponentName: [0; 128],
++                rchRenderModelComponentName: render_model_component,
+             };
+         }
+         vr::EVRInputError::None
+     }
+     fn GetOriginLocalizedName(
+         &self,
+-        _: vr::VRInputValueHandle_t,
+-        _: *mut c_char,
+-        _: u32,
+-        _: i32,
++        origin: vr::VRInputValueHandle_t,
++        name_array: *mut c_char,
++        name_array_size: u32,
++        strings_to_get: i32,
+     ) -> vr::EVRInputError {
+-        crate::warn_unimplemented!("GetOriginLocalizedName");
++        if name_array.is_null() || name_array_size == 0 {
++            return vr::EVRInputError::InvalidParam;
++        }
++
++        let key = InputSourceKey::from(KeyData::from_ffi(origin));
++        let hand = self.hand_from_key(key);
++
++        let source_path = {
++            let map = self.input_source_map.read().unwrap();
++            map.get(key)
++                .map(|s| s.to_string_lossy().to_string())
++                .unwrap_or_default()
++        };
++
++        let mut parts: Vec<String> = Vec::new();
++
++        // k_VRInputString_Hand = 0x01
++        if strings_to_get & 0x01 != 0
++            && let Some(h) = hand
++        {
++            parts.push(
++                match h {
++                    Hand::Left => "Left Hand",
++                    Hand::Right => "Right Hand",
++                }
++                .into(),
++            );
++        }
++        // k_VRInputString_ControllerType = 0x02
++        if strings_to_get & 0x02 != 0 {
++            let session_data = self.openxr.session_data.get();
++            let friendly = hand
++                .and_then(|h| {
++                    session_data
++                        .session
++                        .current_interaction_profile(self.get_subaction_path(h))
++                        .ok()
++                        .filter(|p| *p != xr::Path::NULL)
++                        .and_then(|p| self.openxr.instance.path_to_string(p).ok())
++                })
++                .and_then(|s| s.rsplit('/').next().map(|n| n.replace('_', " ")))
++                .unwrap_or_default();
++            if !friendly.is_empty() {
++                parts.push(friendly);
++            }
++        }
++        // k_VRInputString_InputSource = 0x04
++        if strings_to_get & 0x04 != 0 {
++            if !source_path.is_empty() {
++                parts.push(source_path);
++            } else if let Some(h) = hand {
++                parts.push(
++                    match h {
++                        Hand::Left => "/user/hand/left",
++                        Hand::Right => "/user/hand/right",
++                    }
++                    .into(),
++                );
++            }
++        }
++
++        let display = parts.join(" / ");
++
++        let out = unsafe {
++            std::slice::from_raw_parts_mut(name_array as *mut u8, name_array_size as usize)
++        };
++        let bytes = display.as_bytes();
++        let n = bytes.len().min(out.len() - 1);
++        out[..n].copy_from_slice(&bytes[..n]);
++        out[n] = 0;
++
++        debug!(
++            "GetOriginLocalizedName: origin=0x{:x} strings_to_get=0x{:x} result={:?}",
++            origin, strings_to_get, display
++        );
++
+         vr::EVRInputError::None
+     }
+     fn GetActionOrigins(
+         &self,
+-        _: vr::VRActionSetHandle_t,
+-        _: vr::VRActionHandle_t,
+-        _: *mut vr::VRInputValueHandle_t,
+-        _: u32,
++        _action_set_handle: vr::VRActionSetHandle_t,
++        action_handle: vr::VRActionHandle_t,
++        origins_out: *mut vr::VRInputValueHandle_t,
++        origin_out_count: u32,
+     ) -> vr::EVRInputError {
+-        crate::warn_unimplemented!("GetActionOrigins");
++        if origins_out.is_null() || origin_out_count == 0 {
++            return vr::EVRInputError::InvalidParam;
++        }
++
++        let out = unsafe { std::slice::from_raw_parts_mut(origins_out, origin_out_count as usize) };
++        for slot in out.iter_mut() {
++            *slot = vr::k_ulInvalidInputValueHandle;
++        }
++
++        let session_data = self.openxr.session_data.get();
++        let Some(loaded) = session_data.input_data.get_loaded_actions() else {
++            return vr::EVRInputError::InvalidHandle;
++        };
++
++        let action_key = ActionKey::from(KeyData::from_ffi(action_handle));
++        if !loaded.actions.contains_key(action_key) {
++            // Action handle is valid (from GetActionHandle) but has no loaded bindings.
++            // Return 0 origins with None error instead of InvalidHandle, matching SteamVR behavior.
++            let guard = self.action_map.read().unwrap();
++            if guard.contains_key(action_key) {
++                return vr::EVRInputError::None;
++            }
++            return vr::EVRInputError::InvalidHandle;
++        }
++
++        let related_action_keys = self.related_action_keys(action_key);
++
++        let mut idx = 0;
++
++        debug!(
++            "GetActionOrigins: action 0x{:x} type={:?}, related_actions={}",
++            action_handle,
++            loaded.actions.get(action_key).map(std::mem::discriminant),
++            related_action_keys.len(),
++        );
++
++        match loaded.actions.get(action_key) {
++            // Skeleton actions are tied to exactly one hand - return it directly
++            // without needing any active interaction profile.
++            Some(ActionData::Skeleton(hand)) => {
++                if idx < origin_out_count as usize {
++                    out[idx] = match hand {
++                        Hand::Left => self.left_hand_key.data().as_ffi(),
++                        Hand::Right => self.right_hand_key.data().as_ffi(),
++                    };
++                    idx += 1;
++                }
++            }
++
++            // Pose actions: per_profile_pose_bindings stores explicit per-hand
++            // information for every loaded profile. Scan all profiles so this
++            // works even before the runtime sets an active interaction profile.
++            Some(ActionData::Pose) => {
++                let (mut has_left, mut has_right) = (false, false);
++                for profile_map in loaded.per_profile_pose_bindings.values() {
++                    if let Some(bound_pose) = profile_map.get(action_key) {
++                        has_left |= bound_pose.left.is_some();
++                        has_right |= bound_pose.right.is_some();
++                    }
++                }
++                // Fallback: if no pose bindings at all, check regular bindings
++                // (some profiles may bind pose actions as regular component paths).
++                if !has_left && !has_right {
++                    has_left = true;
++                    has_right = loaded
++                        .per_profile_bindings
++                        .values()
++                        .any(|m| m.get(action_key).map(|v| !v.is_empty()).unwrap_or(false));
++                }
++                for (has, hand_key) in [
++                    (has_left, &self.left_hand_key),
++                    (has_right, &self.right_hand_key),
++                ] {
++                    if has && idx < origin_out_count as usize {
++                        out[idx] = hand_key.data().as_ffi();
++                        idx += 1;
++                    }
++                }
++            }
++
++            // Bool / Analog / Haptic / other actions:
++            // Return specific input source handles so that
++            // GetOriginTrackedDeviceInfo can report the correct component
++            // (e.g. "trigger", "thumbstick") instead of a bare hand path.
++            _ => {
++                let active_profile = self.resolve_active_profile(&session_data, loaded);
++
++                let (mut left_path_str, mut right_path_str): (Option<String>, Option<String>) =
++                    (None, None);
++
++                let profile_maps: Vec<_> = if let Some(ap) = active_profile {
++                    loaded
++                        .per_profile_input_paths
++                        .get(&ap)
++                        .into_iter()
++                        .collect()
++                } else {
++                    loaded.per_profile_input_paths.values().collect()
++                };
++
++                for m in &profile_maps {
++                    for key in &related_action_keys {
++                        if let Some(paths) = m.get(*key) {
++                            for &path in paths {
++                                if let Ok(path_str) = self.openxr.instance.path_to_string(path) {
++                                    if path_str.starts_with("/user/hand/left")
++                                        && left_path_str.is_none()
++                                    {
++                                        left_path_str = Some(path_str.clone());
++                                    }
++                                    if path_str.starts_with("/user/hand/right")
++                                        && right_path_str.is_none()
++                                    {
++                                        right_path_str = Some(path_str);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++
++                // Fallback: some custom bindings with NULL input_path end up only
++                // in per_profile_bindings (legacy path). Return both hands for those.
++                if left_path_str.is_none() && right_path_str.is_none() {
++                    let has_any = loaded.per_profile_bindings.values().any(|m| {
++                        related_action_keys
++                            .iter()
++                            .any(|k| m.get(*k).map(|v| !v.is_empty()).unwrap_or(false))
++                    });
++                    if has_any {
++                        for hand_key in [&self.left_hand_key, &self.right_hand_key] {
++                            if idx < origin_out_count as usize {
++                                out[idx] = hand_key.data().as_ffi();
++                                idx += 1;
++                            }
++                        }
++                    }
++                } else {
++                    for (path_opt, hand_key) in [
++                        (&left_path_str, &self.left_hand_key),
++                        (&right_path_str, &self.right_hand_key),
++                    ] {
++                        if idx < origin_out_count as usize {
++                            let handle = match path_opt {
++                                Some(path_str) => self.get_or_create_input_source_handle(path_str),
++                                None => hand_key.data().as_ffi(),
++                            };
++                            out[idx] = handle;
++                            idx += 1;
++                        }
++                    }
++                }
++            }
++        }
++
++        debug!(
++            "GetActionOrigins: found {} origin(s) for action 0x{:x}",
++            idx, action_handle
++        );
+         vr::EVRInputError::None
+     }
+     fn TriggerHapticVibrationAction(
+@@ -514,7 +1095,8 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
+         _: *mut vr::VRBoneTransform_t,
+         _: u32,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("DecompressSkeletalBoneData");
++        vr::EVRInputError::None
+     }
+     fn GetSkeletalBoneDataCompressed(
+         &self,
+@@ -524,7 +1106,8 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
+         _: u32,
+         _: *mut u32,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("GetSkeletalBoneDataCompressed");
++        vr::EVRInputError::None
+     }
+     fn GetSkeletalSummaryData(
+         &self,
+@@ -633,7 +1216,8 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
+         _: *mut c_char,
+         _: u32,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("GetBoneName");
++        vr::EVRInputError::None
+     }
+     fn GetBoneHierarchy(
+         &self,
+@@ -641,7 +1225,8 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
+         _: *mut vr::BoneIndex_t,
+         _: u32,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("GetBoneHierarchy");
++        vr::EVRInputError::None
+     }
+     fn GetBoneCount(&self, handle: vr::VRActionHandle_t, count: *mut u32) -> vr::EVRInputError {
+         get_action_from_handle!(self, handle, session_data, action);
+@@ -1266,7 +1851,8 @@ impl<C: openxr_data::Compositor> vr::IVRInput004On005 for Input<C> {
+         _transform_array: *mut vr::VRBoneTransform_t,
+         _transform_array_count: u32,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("DecompressSkeletalBoneData");
++        vr::EVRInputError::None
+     }
+ 
+     #[inline]
+@@ -1342,7 +1928,8 @@ impl<C: openxr_data::Compositor> vr::IVRInput004On005 for Input<C> {
+         _required_compressed_size: *mut u32,
+         _restrict_to_device: vr::VRInputValueHandle_t,
+     ) -> vr::EVRInputError {
+-        todo!()
++        crate::warn_unimplemented!("GetSkeletalBoneDataCompressed");
++        vr::EVRInputError::None
+     }
+ }
+ 
+@@ -1604,7 +2191,7 @@ impl<C: openxr_data::Compositor> Input<C> {
+ 
+ enum LoadedActions {
+     Legacy(LegacyActionData),
+-    Manifest(ManifestLoadedActions),
++    Manifest(Box<ManifestLoadedActions>),
+ }
+ 
+ struct ManifestLoadedActions {
+@@ -1614,6 +2201,7 @@ struct ManifestLoadedActions {
+     actions_with_custom_bindings: HashSet<ActionKey>,
+     per_profile_pose_bindings: HashMap<xr::Path, SecondaryMap<ActionKey, BoundPose>>,
+     per_profile_bindings: HashMap<xr::Path, SecondaryMap<ActionKey, Vec<BoolBindingData>>>,
++    per_profile_input_paths: HashMap<xr::Path, SecondaryMap<ActionKey, Vec<xr::Path>>>,
+     info_set: xr::ActionSet,
+     _info_action: xr::Action<bool>,
+     haptic_set: xr::ActionSet,
+diff --git a/src/input/action_manifest.rs b/src/input/action_manifest.rs
+index 8c23ceb..56e42ab 100644
+--- a/src/input/action_manifest.rs
++++ b/src/input/action_manifest.rs
+@@ -155,6 +155,7 @@ impl<C: openxr_data::Compositor> Input<C> {
+             extra_actions,
+             per_profile_bindings,
+             per_profile_pose_bindings,
++            per_profile_input_paths,
+             ..
+         } = binding_context;
+ 
+@@ -226,6 +227,11 @@ impl<C: openxr_data::Compositor> Input<C> {
+             .map(|(k, v)| (k, action_map_to_secondary(&mut act_guard, v)))
+             .collect();
+ 
++        let per_profile_input_paths = per_profile_input_paths
++            .into_iter()
++            .map(|(k, v)| (k, action_map_to_secondary(&mut act_guard, v)))
++            .collect();
++
+         let loaded = super::ManifestLoadedActions {
+             sets,
+             actions,
+@@ -233,6 +239,7 @@ impl<C: openxr_data::Compositor> Input<C> {
+             extra_actions,
+             per_profile_bindings,
+             per_profile_pose_bindings,
++            per_profile_input_paths,
+             _info_action: info_action,
+             info_set,
+             haptic_action,
+@@ -242,7 +249,7 @@ impl<C: openxr_data::Compositor> Input<C> {
+         session_data
+             .input_data
+             .actions
+-            .set(super::LoadedActions::Manifest(loaded))
++            .set(super::LoadedActions::Manifest(Box::new(loaded)))
+             .unwrap_or_else(|_| unreachable!());
+         Ok(())
+     }
+diff --git a/src/input/action_manifest/bindings.rs b/src/input/action_manifest/bindings.rs
+index e477ddc..2fb07c0 100644
+--- a/src/input/action_manifest/bindings.rs
++++ b/src/input/action_manifest/bindings.rs
+@@ -496,6 +496,8 @@ pub fn handle_dpad_binding(
+ 
+     let parent_action_key = format!("{parent_path}-{action_set_name}");
+ 
++    let parent_xr_path = string_to_path(&parent_path.to_string());
++
+     let (xy, click_or_touch_data, haptic_data) = context.get_dpad_parent(
+         &string_to_path,
+         parent_path,
+@@ -506,6 +508,11 @@ pub fn handle_dpad_binding(
+     );
+ 
+     for (path, direction) in bound_actions {
++        // Dpad directions are driven through the parent path; record it so
++        // GetActionBindingInfo/GetActionOrigins can resolve the input source.
++        if let Some(parent_xr_path) = parent_xr_path {
++            context.push_input_path(&path.path, parent_xr_path);
++        }
+         context.add_custom_binding::<DpadData>(
+             path,
+             parent_path.hand,
+@@ -528,10 +535,7 @@ pub fn handle_dpad_binding(
+     let haptic_binding = haptic_data
+         .as_ref()
+         .map(|DpadHapticData { key, binding, .. }| (key.clone(), *binding));
+-    context.push_binding(
+-        parent_action_key,
+-        string_to_path(&parent_path.to_string()).unwrap(),
+-    );
++    context.push_binding(parent_action_key, parent_xr_path.unwrap());
+     if let Some((s, p)) = activator_binding {
+         context.push_binding(s, p);
+     }
+diff --git a/src/input/action_manifest/context.rs b/src/input/action_manifest/context.rs
+index 88c3cef..0784bfd 100644
+--- a/src/input/action_manifest/context.rs
++++ b/src/input/action_manifest/context.rs
+@@ -17,6 +17,9 @@ pub(super) struct BindingsLoadContext<'a> {
+     pub extra_actions: HashMap<String, ExtraActionData>,
+     pub per_profile_bindings: HashMap<xr::Path, HashMap<String, Vec<BoolBindingData>>>,
+     pub per_profile_pose_bindings: HashMap<xr::Path, HashMap<String, BoundPose>>,
++    /// Maps each interaction profile path → action name → bound input paths.
++    /// Used to implement GetActionBindingInfo/GetActionOrigins.
++    pub per_profile_input_paths: HashMap<xr::Path, HashMap<String, Vec<xr::Path>>>,
+     pub grip_action: &'a xr::Action<xr::Posef>,
+     pub info_action: &'a xr::Action<bool>,
+     pub haptic_action: &'a xr::Action<xr::Haptic>,
+@@ -38,6 +41,7 @@ impl<'a> BindingsLoadContext<'a> {
+             extra_actions: Default::default(),
+             per_profile_bindings: Default::default(),
+             per_profile_pose_bindings: Default::default(),
++            per_profile_input_paths: Default::default(),
+             grip_action,
+             info_action,
+             haptic_action,
+@@ -80,12 +84,17 @@ impl BindingsLoadContext<'_> {
+             .per_profile_pose_bindings
+             .entry(interaction_profile)
+             .or_default();
++        let input_paths_out = self
++            .per_profile_input_paths
++            .entry(interaction_profile)
++            .or_default();
+         Some(BindingsProfileLoadContext {
+             action_sets: self.action_sets,
+             actions: &mut self.actions,
+             extra_actions: &mut self.extra_actions,
+             bindings_parsed,
+             pose_bindings,
++            input_paths_out,
+             grip_action: self.grip_action,
+             info_action: self.info_action,
+             haptic_action: self.haptic_action,
+@@ -104,6 +113,8 @@ pub(super) struct BindingsProfileLoadContext<'a> {
+     extra_actions: &'a mut HashMap<String, ExtraActionData>,
+     bindings_parsed: &'a mut HashMap<String, Vec<BoolBindingData>>,
+     pub pose_bindings: &'a mut HashMap<String, BoundPose>,
++    /// Input paths bound to each action in the current profile, keyed by action name.
++    pub input_paths_out: &'a mut HashMap<String, Vec<xr::Path>>,
+     pub grip_action: &'a xr::Action<xr::Posef>,
+     pub info_action: &'a xr::Action<bool>,
+     pub haptic_action: &'a xr::Action<xr::Haptic>,
+@@ -185,6 +196,10 @@ impl BindingsProfileLoadContext<'_> {
+                 .instance
+                 .string_to_path(&input_path.to_string())
+                 .unwrap();
++            self.input_paths_out
++                .entry(action_path.clone())
++                .or_default()
++                .push(binding_path);
+             self.bindings.push((action_path, binding_path));
+         }
+     }
+@@ -229,9 +244,22 @@ impl BindingsProfileLoadContext<'_> {
+     }
+ 
+     pub fn push_binding(&mut self, action: String, path: xr::Path) {
++        self.input_paths_out
++            .entry(action.clone())
++            .or_default()
++            .push(path);
+         self.bindings.push((action, path));
+     }
+ 
++    /// Record the input path bound to an action that doesn't get a regular
++    /// `push_binding` (dpad directions are driven through custom bindings).
++    pub fn push_input_path(&mut self, action: &str, path: xr::Path) {
++        self.input_paths_out
++            .entry(action.to_string())
++            .or_default()
++            .push(path);
++    }
++
+     pub fn get_dpad_parent(
+         &mut self,
+         string_to_path: &impl Fn(&str) -> Option<xr::Path>,
+diff --git a/src/input/devices.rs b/src/input/devices.rs
+index bdd9e70..232fb94 100644
+--- a/src/input/devices.rs
++++ b/src/input/devices.rs
+@@ -278,6 +278,7 @@ impl TrackedDevice {
+                 TrackedDeviceType::Hmd => unreachable!(),
+             },
+             vr::ETrackedDeviceProperty::ManufacturerName_String => Some(data.manufacturer_name),
++            vr::ETrackedDeviceProperty::InputProfilePath_String => Some(data.input_profile_path),
+             _ => None,
+         }
+     }
+diff --git a/src/input/profiles.rs b/src/input/profiles.rs
+index d929080..2ce20ad 100644
+--- a/src/input/profiles.rs
++++ b/src/input/profiles.rs
+@@ -290,6 +290,9 @@ pub struct ProfileProperties {
+     pub tracking_system_name: &'static CStr,
+     /// Corresponds to Prop_ManufacturerName_String
+     pub manufacturer_name: &'static CStr,
++    /// Corresponds to Prop_InputProfilePath_String
++    /// Path to the input profile JSON, e.g. "{oculus}/input/touch_profile.json"
++    pub input_profile_path: &'static CStr,
+     /// Corresponds to Prop_SupportedButtons_Uint64
+     /// Can be pulled from a SteamVR System Report
+     pub legacy_buttons_mask: u64,
+diff --git a/src/input/profiles/knuckles.rs b/src/input/profiles/knuckles.rs
+index 4b297d5..9f5bf40 100644
+--- a/src/input/profiles/knuckles.rs
++++ b/src/input/profiles/knuckles.rs
+@@ -61,6 +61,7 @@ impl InteractionProfile for Knuckles {
+             },
+             tracking_system_name: c"lighthouse",
+             manufacturer_name: c"Valve",
++            input_profile_path: c"{indexcontroller}/input/index_controller_profile.json",
+             legacy_buttons_mask: button_mask_from_ids!(
+                 EVRButtonId::System,
+                 EVRButtonId::ApplicationMenu,
+diff --git a/src/input/profiles/meta_touch_plus.rs b/src/input/profiles/meta_touch_plus.rs
+index a82e5f3..d88ecba 100644
+--- a/src/input/profiles/meta_touch_plus.rs
++++ b/src/input/profiles/meta_touch_plus.rs
+@@ -47,6 +47,7 @@ impl InteractionProfile for MetaTouchPlus {
+             },
+             tracking_system_name: c"oculus",
+             manufacturer_name: c"Oculus",
++            input_profile_path: c"{meta}/input/touch_controller_plus_profile.json",
+             main_axis: MainAxisType::Thumbstick,
+             legacy_buttons_mask: button_mask_from_ids!(
+                 System,
+diff --git a/src/input/profiles/oculus_touch.rs b/src/input/profiles/oculus_touch.rs
+index 2c27503..ba7b8ca 100644
+--- a/src/input/profiles/oculus_touch.rs
++++ b/src/input/profiles/oculus_touch.rs
+@@ -46,6 +46,7 @@ impl InteractionProfile for OculusTouch {
+             },
+             tracking_system_name: c"oculus",
+             manufacturer_name: c"Oculus",
++            input_profile_path: c"{oculus}/input/touch_profile.json",
+             main_axis: MainAxisType::Thumbstick,
+             legacy_buttons_mask: button_mask_from_ids!(
+                 System,
+diff --git a/src/input/profiles/simple_controller.rs b/src/input/profiles/simple_controller.rs
+index 6f4aad1..a225c4e 100644
+--- a/src/input/profiles/simple_controller.rs
++++ b/src/input/profiles/simple_controller.rs
+@@ -29,6 +29,7 @@ impl InteractionProfile for SimpleController {
+             },
+             tracking_system_name: c"lighthouse",
+             manufacturer_name: c"HTC",
++            input_profile_path: c"",
+             legacy_buttons_mask: button_mask_from_ids!(
+                 btn::System,
+                 btn::ApplicationMenu,
+diff --git a/src/input/profiles/vive_controller.rs b/src/input/profiles/vive_controller.rs
+index b999143..b07d797 100644
+--- a/src/input/profiles/vive_controller.rs
++++ b/src/input/profiles/vive_controller.rs
+@@ -42,6 +42,7 @@ impl InteractionProfile for ViveWands {
+             },
+             tracking_system_name: c"lighthouse",
+             manufacturer_name: c"HTC",
++            input_profile_path: c"{htc}/input/vive_controller_profile.json",
+             legacy_buttons_mask: button_mask_from_ids!(System, ApplicationMenu, Grip, Axis0, Axis1),
+         };
+         &DEVICE_PROPERTIES
+diff --git a/src/input/profiles/vive_focus3.rs b/src/input/profiles/vive_focus3.rs
+index 4468303..bd02c60 100644
+--- a/src/input/profiles/vive_focus3.rs
++++ b/src/input/profiles/vive_focus3.rs
+@@ -46,6 +46,8 @@ impl InteractionProfile for ViveFocus3 {
+             },
+             tracking_system_name: c"htc_eyes",
+             manufacturer_name: c"htc_rr",
++            input_profile_path:
++                c"{htc_business_streaming}/input/vive_focus3_controller_profile.json",
+             main_axis: MainAxisType::Thumbstick,
+             legacy_buttons_mask: button_mask_from_ids!(
+                 btn::System,
+diff --git a/src/input/profiles/vive_tracker.rs b/src/input/profiles/vive_tracker.rs
+index 98475aa..6aa694d 100644
+--- a/src/input/profiles/vive_tracker.rs
++++ b/src/input/profiles/vive_tracker.rs
+@@ -22,6 +22,7 @@ impl InteractionProfile for ViveTracker {
+             serial_number: Property::BothHands(c"vive_tracker"), // This gets replaced
+             tracking_system_name: c"lighthouse",
+             manufacturer_name: c"HTC",
++            input_profile_path: c"{htc}/input/vive_tracker_profile.json",
+             legacy_buttons_mask: 0u64, // This is the closest thing I could think of to NOOP this
+         };
+ 
+diff --git a/src/input/tests.rs b/src/input/tests.rs
+index c2160e7..0a67048 100644
+--- a/src/input/tests.rs
++++ b/src/input/tests.rs
+@@ -1085,3 +1085,173 @@ fn load_actions_race() {
+     let res = f.get_bool_state(boolact);
+     assert!(res.is_ok(), "{res:?}");
+ }
++
++#[track_caller]
++fn buf_str(buf: &[std::ffi::c_char]) -> String {
++    unsafe { CStr::from_ptr(buf.as_ptr()) }
++        .to_string_lossy()
++        .into_owned()
++}
++
++#[track_caller]
++fn get_binding_info(f: &Fixture, action: vr::VRActionHandle_t) -> Vec<vr::InputBindingInfo_t> {
++    let mut count = 0;
++    assert_eq!(
++        vr::IVRInput011_Interface::GetActionBindingInfo(
++            f.input.as_ref(),
++            action,
++            std::ptr::null_mut(),
++            0,
++            0,
++            &mut count,
++        ),
++        vr::EVRInputError::None
++    );
++
++    let mut info = vec![vr::InputBindingInfo_t::default(); count as usize];
++    if count > 0 {
++        assert_eq!(
++            vr::IVRInput011_Interface::GetActionBindingInfo(
++                f.input.as_ref(),
++                action,
++                info.as_mut_ptr(),
++                std::mem::size_of::<vr::InputBindingInfo_t>() as u32,
++                count,
++                &mut count,
++            ),
++            vr::EVRInputError::None
++        );
++    }
++    info
++}
++
++#[track_caller]
++fn get_action_origins(
++    f: &Fixture,
++    set: vr::VRActionSetHandle_t,
++    action: vr::VRActionHandle_t,
++) -> Vec<vr::VRInputValueHandle_t> {
++    let mut origins = [vr::k_ulInvalidInputValueHandle; 8];
++    assert_eq!(
++        vr::IVRInput011_Interface::GetActionOrigins(
++            f.input.as_ref(),
++            set,
++            action,
++            origins.as_mut_ptr(),
++            origins.len() as u32,
++        ),
++        vr::EVRInputError::None
++    );
++    origins
++        .into_iter()
++        .filter(|o| *o != vr::k_ulInvalidInputValueHandle)
++        .collect()
++}
++
++#[track_caller]
++fn get_origin_info(f: &Fixture, origin: vr::VRInputValueHandle_t) -> vr::InputOriginInfo_t {
++    let mut info = vr::InputOriginInfo_t::default();
++    assert_eq!(
++        vr::IVRInput011_Interface::GetOriginTrackedDeviceInfo(
++            f.input.as_ref(),
++            origin,
++            &mut info,
++            std::mem::size_of::<vr::InputOriginInfo_t>() as u32,
++        ),
++        vr::EVRInputError::None
++    );
++    info
++}
++
++#[test]
++fn action_binding_info() {
++    let mut f = Fixture::new();
++    let set1 = f.get_action_set_handle(c"/actions/set1");
++    f.load_actions(c"actions.json");
++    f.set_interaction_profile::<OculusTouch>(LeftHand);
++    f.set_interaction_profile::<OculusTouch>(RightHand);
++    f.sync(vr::VRActiveActionSet_t {
++        ulActionSet: set1,
++        ..Default::default()
++    });
++
++    // Bound only to the left trigger touch in oculus.json.
++    let action = f.get_action_handle(c"/actions/set1/in/boolact3");
++    let info = get_binding_info(&f, action);
++
++    assert_eq!(info.len(), 1);
++    assert_eq!(buf_str(&info[0].rchDevicePathName), "/user/hand/left");
++    assert_eq!(buf_str(&info[0].rchInputPathName), "/input/trigger");
++    assert_eq!(buf_str(&info[0].rchModeName), "trigger");
++    assert_eq!(buf_str(&info[0].rchSlotName), "touch");
++    assert_eq!(buf_str(&info[0].rchInputSourceType), "trigger");
++}
++
++#[test]
++fn action_origins() {
++    let mut f = Fixture::new();
++    let set1 = f.get_action_set_handle(c"/actions/set1");
++    f.load_actions(c"actions.json");
++    f.set_interaction_profile::<OculusTouch>(LeftHand);
++    f.set_interaction_profile::<OculusTouch>(RightHand);
++    f.sync(vr::VRActiveActionSet_t {
++        ulActionSet: set1,
++        ..Default::default()
++    });
++
++    let action = f.get_action_handle(c"/actions/set1/in/boolact3");
++    let origins = get_action_origins(&f, set1, action);
++    assert!(!origins.is_empty());
++
++    let info = get_origin_info(&f, origins[0]);
++    assert_eq!(info.trackedDeviceIndex, Hand::Left as u32);
++    assert_eq!(buf_str(&info.rchRenderModelComponentName), "trigger");
++
++    let mut name = [0 as std::ffi::c_char; 256];
++    assert_eq!(
++        vr::IVRInput011_Interface::GetOriginLocalizedName(
++            f.input.as_ref(),
++            origins[0],
++            name.as_mut_ptr(),
++            name.len() as u32,
++            0x01 | 0x02 | 0x04,
++        ),
++        vr::EVRInputError::None
++    );
++    assert_eq!(
++        buf_str(&name),
++        "Left Hand / touch controller / /user/hand/left/input/trigger/touch"
++    );
++}
++
++#[test]
++fn dpad_action_binding_info() {
++    let mut f = Fixture::new();
++    let set1 = f.get_action_set_handle(c"/actions/set1");
++    f.load_actions(c"actions_dpad.json");
++    f.set_interaction_profile::<ViveWands>(LeftHand);
++    f.sync(vr::VRActiveActionSet_t {
++        ulActionSet: set1,
++        ..Default::default()
++    });
++
++    // Bound to the north direction of a trackpad dpad, which is driven by the
++    // synthetic parent action (see wands_dpad.json).
++    let action = f.get_action_handle(c"/actions/set1/in/boolact");
++    let info = get_binding_info(&f, action);
++
++    assert_eq!(info.len(), 1);
++    assert_eq!(buf_str(&info[0].rchDevicePathName), "/user/hand/left");
++    assert_eq!(buf_str(&info[0].rchInputPathName), "/input/trackpad");
++    assert_eq!(buf_str(&info[0].rchModeName), "trackpad");
++    assert_eq!(buf_str(&info[0].rchSlotName), "position");
++
++    let origins = get_action_origins(&f, set1, action);
++    assert!(!origins.is_empty());
++
++    let origin_info = get_origin_info(&f, origins[0]);
++    assert_eq!(
++        buf_str(&origin_info.rchRenderModelComponentName),
++        "trackpad"
++    );
++}

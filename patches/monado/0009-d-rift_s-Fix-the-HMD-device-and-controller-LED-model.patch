@@ -1,0 +1,90 @@
+From a9ea918e7c66099fdc21e9fe842fca340b2a4b95 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:20:19 +0200
+Subject: [PATCH] d/rift_s: Fix the HMD device and controller LED model offsets
+
+The relation chain wants the pose of the target in the IMU frame, but
+the HMD device pose pushed device_from_imu. That put the device (eye)
+origin 2x the IMU offset in front of where it is: the HMD IMU sits
+6.9 cm in front of and 1.9 cm below the device origin, so the views
+were ~14 cm too far forward and ~4 cm too low relative to the
+controllers, which made hands look too close to the head and arms too
+short. Same for the (unused) left camera pose.
+
+The controller LED model was moved to the IMU frame with P_device_imu
+(LED + ImuPosition) instead of P_imu_device (LED - ImuPosition),
+shifting the model, and with it the tracked IMU and aim poses, by
+2x ImuPosition (~4.5 cm). Replaying recorded sessions with the optical
+fixes corrected by k x ImuPosition gives the lowest IMU/optical
+innovation at k = 2 for both controllers (median e.g. 6.8 -> 3.7 mm).
+
+Also apply the grip offset in device space, before the device->IMU
+offset, instead of the other way round.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_controller.c | 15 +++++++++------
+ src/xrt/drivers/rift_s/rift_s_tracker.c    |  7 +++++--
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index 822d221..88871ac 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -695,8 +695,9 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
+ 	if (name == XRT_INPUT_TOUCH_AIM_POSE) {
+ 		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
+ 	} else if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
+-		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
++		// Leaf first: grip in device (aim) space, then device in IMU space
+ 		m_relation_chain_push_pose(&xrc, &ctrl->P_aim_grip);
++		m_relation_chain_push_pose(&xrc, &ctrl->P_imu_device);
+ 	}
+ 
+ 	/* Apply the fusion rotation */
+@@ -832,15 +833,17 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
+ 	t_constellation_led_model_init((int)ctrl->base.device_type, NULL, led_model, ctrl->calibration.num_leds,
+ 	                               0);
+ 
+-	// Note: This LED model is in OpenXR coordinates with
+-	// XYZ = Right/Down/Forward. Flip to OpenCV for the constellation tracker
+-	// after moving to imu-relative position
++	// Note: This LED model is in OpenXR device coordinates. Move it to be
++	// IMU-relative (P_imu_device: device -> IMU coordinates, LED - ImuPosition),
++	// then flip to OpenCV for the constellation tracker. Using P_device_imu here
++	// shifted the model by 2x ImuPosition (~4.5 cm); replaying recordings with
++	// the fixes corrected that way minimises the IMU/optical innovation.
+ 	for (int i = 0; i < ctrl->calibration.num_leds; i++) {
+ 		struct t_constellation_led *led = led_model->leds + i;
+ 		struct xrt_vec3 pos, dir;
+ 
+-		math_pose_transform_point(&ctrl->P_device_imu, &ctrl->calibration.leds[i].pos, &pos);
+-		math_quat_rotate_vec3(&ctrl->P_device_imu.orientation, &ctrl->calibration.leds[i].dir, &dir);
++		math_pose_transform_point(&ctrl->P_imu_device, &ctrl->calibration.leds[i].pos, &pos);
++		math_quat_rotate_vec3(&ctrl->P_imu_device.orientation, &ctrl->calibration.leds[i].dir, &dir);
+ 
+ 		led->id = i;
+ 		led->pos.x = pos.x;
+diff --git a/src/xrt/drivers/rift_s/rift_s_tracker.c b/src/xrt/drivers/rift_s/rift_s_tracker.c
+index 67e80b1..4e1c8c2 100644
+--- a/src/xrt/drivers/rift_s/rift_s_tracker.c
++++ b/src/xrt/drivers/rift_s/rift_s_tracker.c
+@@ -786,10 +786,13 @@ rift_s_tracker_get_tracked_pose(struct rift_s_tracker *t,
+ {
+ 	struct xrt_relation_chain xrc = {0};
+ 
++	/* The chain needs the pose of the target in the IMU frame (imu_from_X), so push the inverses.
++	 * Pushing device_from_imu directly put the device origin 2x the IMU offset (~14 cm) too far
++	 * forward, so hands looked too close to the head. */
+ 	if (pose == RIFT_S_TRACKER_POSE_DEVICE) {
+-		m_relation_chain_push_pose(&xrc, &t->device_from_imu);
++		m_relation_chain_push_inverted_pose_if_not_identity(&xrc, &t->device_from_imu);
+ 	} else if (pose == RIFT_S_TRACKER_POSE_LEFT_CAMERA) {
+-		m_relation_chain_push_pose(&xrc, &t->left_cam_from_imu);
++		m_relation_chain_push_inverted_pose_if_not_identity(&xrc, &t->left_cam_from_imu);
+ 	}
+ 
+ 	if (t->tracking.slam_enabled && t->slam_over_3dof) {
+-- 
+2.54.0
+

@@ -1,0 +1,551 @@
+From b927617cac953771c99e38d3b68349be9c630eb5 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:41:58 +0200
+Subject: [PATCH] d/rift_s: Controller vibration
+
+The Touch controllers' raw motor register (0x97) is written over the radio
+with report 0x13 (97 01 08 00 <amplitude>), format from the rift-s-linux
+driver. The motor latches the amplitude, so the USB thread writes changes
+and an explicit 0 when a request ends, on shutdown, and when a controller
+first shows up (in case a crash left it running). At most one write in
+flight, queued only when the radio is idle, hands take turns. Requests
+shorter than RIFT_S_HAPTICS_MIN_MS (20) are stretched so per-frame game
+pulses don't toggle the motor; RIFT_S_HAPTICS_SCALE scales or disables.
+Status file: per controller haptic amplitude / writes / failed / rtt.
+RIFT_S_HAPTICS_LOG=<path> appends the applications' requests as CSV
+(t_ms, hand, amplitude, duration_ms, frequency) for tuning.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s.c            | 234 ++++++++++++++++++++-
+ src/xrt/drivers/rift_s/rift_s.h            |  40 ++++
+ src/xrt/drivers/rift_s/rift_s_controller.c |  14 ++
+ src/xrt/drivers/rift_s/rift_s_radio.c      |  60 +++++-
+ src/xrt/drivers/rift_s/rift_s_radio.h      |  11 +
+ 5 files changed, 349 insertions(+), 10 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s.c b/src/xrt/drivers/rift_s/rift_s.c
+index 3beac32..a8e29ea 100644
+--- a/src/xrt/drivers/rift_s/rift_s.c
++++ b/src/xrt/drivers/rift_s/rift_s.c
+@@ -29,6 +29,7 @@
+ #include <time.h>
+ #include <assert.h>
+ #include <inttypes.h>
++#include <math.h>
+ #include <unistd.h>
+ 
+ #include "math/m_api.h"
+@@ -60,6 +61,18 @@ DEBUG_GET_ONCE_OPTION(rift_s_status_file, "RIFT_S_STATUS_FILE", NULL)
+ 
+ //! Status file update interval
+ #define STATUS_INTERVAL_MS 250
++
++//! Scales controller vibration strength (0..1 from the application), 0 disables vibration
++DEBUG_GET_ONCE_FLOAT_OPTION(rift_s_haptics_scale, "RIFT_S_HAPTICS_SCALE", 1.0f)
++//! Shortest vibration: games send 1-4 ms pulses every frame, shorter would toggle the motor between frames
++DEBUG_GET_ONCE_NUM_OPTION(rift_s_haptics_min_ms, "RIFT_S_HAPTICS_MIN_MS", 20)
++//! CSV log of the applications' vibration requests (before scaling / stretching), for tuning
++DEBUG_GET_ONCE_OPTION(rift_s_haptics_log, "RIFT_S_HAPTICS_LOG", NULL)
++
++//! Longest single request, so a client that dies mid-vibration can't leave a motor running
++#define HAPTIC_MAX_DURATION_NS (10LL * U_TIME_1S_IN_NS)
++//! Wait before retrying a failed motor write
++#define HAPTIC_RETRY_NS (20 * U_TIME_1MS_IN_NS)
+ static void
+ rift_s_system_free(struct rift_s_system *sys);
+ 
+@@ -206,6 +219,27 @@ rift_s_system_create(struct xrt_prober *xp,
+ 		goto cleanup;
+ 	}
+ 
++	ret = os_mutex_init(&sys->haptic_mutex);
++	if (ret != 0) {
++		RIFT_S_ERROR("Failed to init haptics mutex");
++		goto cleanup;
++	}
++	const char *haptic_log = debug_get_option_rift_s_haptics_log();
++	if (haptic_log != NULL && haptic_log[0] != '\0') {
++		sys->haptic_log = fopen(haptic_log, "a");
++		if (sys->haptic_log != NULL) {
++			setvbuf(sys->haptic_log, NULL, _IOLBF, 0);
++			fprintf(sys->haptic_log, "t_ms,hand,amplitude,duration_ms,frequency\n");
++		} else {
++			RIFT_S_WARN("Could not open RIFT_S_HAPTICS_LOG %s", haptic_log);
++		}
++	}
++	for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
++		sys->haptics[i].sys = sys;
++		sys->haptics[i].hand = i;
++		sys->haptics[i].applied = -1;
++	}
++
+ 	/* Status file: RIFT_S_STATUS_FILE=<path>, empty to disable, default in XDG_RUNTIME_DIR */
+ 	const char *status_path = debug_get_option_rift_s_status_file();
+ 	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+@@ -292,6 +326,192 @@ cleanup:
+ 	return NULL;
+ }
+ 
++/*
++ * Controller vibration.
++ *
++ * The Touch controllers have a raw motor register (0x97) written over the radio with report 0x13:
++ * 97 01 08 00 <amplitude 0-255>. It has no frequency or duration, the motor keeps the amplitude
++ * until the next write, so the USB thread writes changes and an explicit 0 at the end.
++ */
++
++xrt_result_t
++rift_s_system_set_haptic(struct rift_s_system *sys, int hand, const struct xrt_output_value_vibration *value)
++{
++	if (hand < 0 || hand >= MAX_TRACKED_DEVICES) {
++		return XRT_ERROR_OUTPUT_UNSUPPORTED;
++	}
++
++	float amplitude = value->amplitude * debug_get_float_option_rift_s_haptics_scale();
++	if (!isfinite(amplitude) || amplitude < 0.0f) {
++		amplitude = 0.0f;
++	} else if (amplitude > 1.0f) {
++		amplitude = 1.0f;
++	}
++
++	// XR_MIN_HAPTIC_DURATION is -1, XR_INFINITE_DURATION INT64_MAX
++	int64_t min_ns = debug_get_num_option_rift_s_haptics_min_ms() * U_TIME_1MS_IN_NS;
++	int64_t duration_ns = value->duration_ns;
++	if (duration_ns < min_ns) {
++		duration_ns = min_ns;
++	} else if (duration_ns > HAPTIC_MAX_DURATION_NS) {
++		duration_ns = HAPTIC_MAX_DURATION_NS;
++	}
++
++	struct rift_s_haptic *h = &sys->haptics[hand];
++	uint8_t raw = (uint8_t)lroundf(amplitude * 255.0f);
++	timepoint_ns now = os_monotonic_get_ns();
++
++	os_mutex_lock(&sys->haptic_mutex);
++	h->amplitude = raw;
++	h->end_ns = raw == 0 ? 0 : now + duration_ns;
++	if (sys->haptic_log != NULL) {
++		fprintf(sys->haptic_log, "%.3f,%s,%.3f,%.3f,%.1f\n", (double)now / U_TIME_1MS_IN_NS,
++		        hand == 0 ? "L" : "R", value->amplitude, (double)value->duration_ns / U_TIME_1MS_IN_NS,
++		        value->frequency);
++	}
++	os_mutex_unlock(&sys->haptic_mutex);
++
++	return XRT_SUCCESS;
++}
++
++static void
++encode_haptic_write(uint8_t amplitude, uint8_t out[5])
++{
++	out[0] = 0x97; // raw motor register
++	out[1] = 0x01; // 1 byte
++	out[2] = 0x08; // unknown (a timeout?), value from the rift-s-linux driver
++	out[3] = 0x00;
++	out[4] = amplitude;
++}
++
++static void
++haptic_write_cb(bool success, uint8_t *response_bytes, int response_bytes_len, void *cb_data)
++{
++	struct rift_s_haptic *h = cb_data;
++	timepoint_ns now = os_monotonic_get_ns();
++
++	// The reply starts with a 32 bit status, 0 = written
++	uint32_t status = UINT32_MAX;
++	if (success && response_bytes_len >= 4) {
++		status = response_bytes[0] | (response_bytes[1] << 8) | (response_bytes[2] << 16) |
++		         ((uint32_t)response_bytes[3] << 24);
++	}
++
++	h->in_flight = false;
++	if (status == 0) {
++		h->applied = h->sent;
++		h->last_rtt_ms = (double)(now - h->sent_ns) / U_TIME_1MS_IN_NS;
++	} else {
++		h->failed++;
++		h->retry_ns = now + HAPTIC_RETRY_NS;
++		RIFT_S_DEBUG("Controller %d vibration write failed (status 0x%x)", h->hand, status);
++	}
++}
++
++static uint64_t
++haptic_device_id(struct rift_s_system *sys, int hand)
++{
++	rift_s_device_type type = hand == 0 ? RIFT_S_DEVICE_LEFT_CONTROLLER : RIFT_S_DEVICE_RIGHT_CONTROLLER;
++
++	for (int i = 0; i < sys->num_active_tracked_devices; i++) {
++		if (sys->tracked_device[i].device_type == type) {
++			return sys->tracked_device[i].device_id;
++		}
++	}
++	return 0;
++}
++
++//! USB thread: queue at most one motor write, when the radio has nothing else to do
++static void
++update_haptics(struct rift_s_system *sys)
++{
++	if (sys->radio_state.pending_commands != NULL) {
++		return;
++	}
++
++	timepoint_ns now = os_monotonic_get_ns();
++
++	for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
++		// Take turns, so a hand that changes every frame can't starve the other one
++		int hand = (sys->haptic_turn + i) % MAX_TRACKED_DEVICES;
++		struct rift_s_haptic *h = &sys->haptics[hand];
++
++		if (h->in_flight || now < h->retry_ns) {
++			continue;
++		}
++
++		uint64_t device_id = haptic_device_id(sys, hand);
++		if (device_id == 0) {
++			continue; // Not on the radio yet
++		}
++		if (device_id != h->device_id) {
++			// New controller: its motor state is unknown, stop it first
++			h->device_id = device_id;
++			h->applied = -1;
++		}
++
++		os_mutex_lock(&sys->haptic_mutex);
++		uint8_t want = now < h->end_ns ? h->amplitude : 0;
++		os_mutex_unlock(&sys->haptic_mutex);
++
++		if (want == h->applied) {
++			continue;
++		}
++
++		uint8_t cmd[5];
++		encode_haptic_write(want, cmd);
++		h->sent = want;
++		h->sent_ns = now;
++		h->in_flight = true;
++		h->writes++;
++		rift_s_radio_queue_write(&sys->radio_state, device_id, cmd, sizeof(cmd), haptic_write_cb, h);
++
++		sys->haptic_turn = hand + 1;
++		return;
++	}
++}
++
++//! After the USB thread stopped: switch off any motor that is (or may be) running
++static void
++stop_haptics(struct rift_s_system *sys)
++{
++	struct os_hid_device *hid = sys->handles[HMD_HID];
++	if (hid == NULL) {
++		return;
++	}
++
++	bool need_stop[MAX_TRACKED_DEVICES];
++	bool any = false;
++	for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
++		struct rift_s_haptic *h = &sys->haptics[i];
++		need_stop[i] = h->device_id != 0 && (h->applied != 0 || h->in_flight);
++		any |= need_stop[i];
++	}
++	if (!any) {
++		return;
++	}
++
++	rift_s_radio_state_drop_queued(&sys->radio_state);
++
++	uint8_t cmd[5];
++	encode_haptic_write(0, cmd);
++	for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
++		if (need_stop[i]) {
++			rift_s_radio_queue_write(&sys->radio_state, sys->haptics[i].device_id, cmd, sizeof(cmd), NULL,
++			                         NULL);
++		}
++	}
++
++	timepoint_ns deadline = os_monotonic_get_ns() + 250 * U_TIME_1MS_IN_NS;
++	while (sys->radio_state.pending_commands != NULL && os_monotonic_get_ns() < deadline) {
++		rift_s_radio_update(&sys->radio_state, hid);
++		os_nanosleep(U_TIME_1MS_IN_NS / 2);
++	}
++	if (sys->radio_state.pending_commands != NULL) {
++		RIFT_S_WARN("Could not switch off the controller vibration before shutdown");
++	}
++}
++
+ static void
+ rift_s_system_free(struct rift_s_system *sys)
+ {
+@@ -302,6 +522,8 @@ rift_s_system_free(struct rift_s_system *sys)
+ 	/* Stop the packet reading thread */
+ 	os_thread_helper_destroy(&sys->oth);
+ 
++	stop_haptics(sys);
++
+ 	/* Stop all the frame processing (has to happen before the cameras
+ 	 * and tracker are destroyed */
+ 	xrt_frame_context_destroy_nodes(&sys->xfctx);
+@@ -328,6 +550,10 @@ rift_s_system_free(struct rift_s_system *sys)
+ 		rift_s_tracker_destroy(sys->tracker);
+ 	}
+ 
++	if (sys->haptic_log != NULL) {
++		fclose(sys->haptic_log);
++	}
++	os_mutex_destroy(&sys->haptic_mutex);
+ 	os_mutex_destroy(&sys->dev_mutex);
+ 
+ 	if (sys->status_path[0] != '\0') {
+@@ -684,13 +910,16 @@ write_status_file(struct rift_s_system *sys, timepoint_ns now)
+ 		        "\"battery\": %u, \"fusion_initialised\": %s, \"position_tracked\": %s, "
+ 		        "\"position\": [%.4f, %.4f, %.4f], \"imu_samples\": %" PRIu64 ", \"fixes_accepted\": %" PRIu64
+ 		        ", \"fixes_rejected\": %" PRIu64 ", \"fixes_ignored\": %" PRIu64 ", \"resets\": %" PRIu64
+-		        ", \"tilt_rejections\": %" PRIu64 ", \"last_innovation_m\": %.4f}",
++		        ", \"tilt_rejections\": %" PRIu64 ", \"last_innovation_m\": %.4f, "
++		        "\"haptic\": {\"amplitude\": %d, \"writes\": %" PRIu64 ", \"failed\": %" PRIu64
++		        ", \"rtt_ms\": %.1f}}",
+ 		        paired ? "true" : "false", status_age_ms(now, st.last_report_ns),
+ 		        status_age_ms(now, st.last_imu_ns), status_age_ms(now, st.last_optical_ns), st.battery,
+ 		        st.fusion_initialised ? "true" : "false", st.position_tracked ? "true" : "false",
+ 		        st.position.x, st.position.y, st.position.z, st.fusion.imu_samples, st.fusion.poses_accepted,
+ 		        st.fusion.poses_rejected, st.fusion.poses_ignored, st.fusion.resets, st.fusion.tilt_rejections,
+-		        st.fusion.last_pos_innovation);
++		        st.fusion.last_pos_innovation, sys->haptics[i].applied, sys->haptics[i].writes,
++		        sys->haptics[i].failed, sys->haptics[i].last_rtt_ms);
+ 	}
+ 	os_mutex_unlock(&sys->dev_mutex);
+ 
+@@ -722,6 +951,7 @@ rift_s_run_thread(void *ptr)
+ 		bool success = handle_packets(sys);
+ 
+ 		if (success) {
++			update_haptics(sys);
+ 			rift_s_radio_update(&sys->radio_state, sys->handles[HMD_HID]);
+ 
+ 			os_mutex_lock(&sys->dev_mutex);
+diff --git a/src/xrt/drivers/rift_s/rift_s.h b/src/xrt/drivers/rift_s/rift_s.h
+index a9c0ebd..57957ec 100644
+--- a/src/xrt/drivers/rift_s/rift_s.h
++++ b/src/xrt/drivers/rift_s/rift_s.h
+@@ -17,6 +17,8 @@
+ 
+ #pragma once
+ 
++#include <stdio.h>
++
+ #include "os/os_threading.h"
+ #include "util/u_logging.h"
+ #include "xrt/xrt_defines.h"
+@@ -68,6 +70,31 @@ struct rift_s_hmd_config
+ 	struct rift_s_lens_calibration lens_calibration;
+ };
+ 
++/*!
++ * Vibration motor of one controller. The radio register latches the amplitude, so the
++ * USB thread writes a new value when the request changes, and an explicit 0 to stop.
++ */
++struct rift_s_haptic
++{
++	struct rift_s_system *sys;
++	int hand;
++
++	/* Requested by the application (set_output), protected by haptic_mutex */
++	uint8_t amplitude;
++	timepoint_ns end_ns;
++
++	/* Radio side, only touched by the USB thread */
++	uint64_t device_id;   //!< Controller the last write went to
++	int applied;          //!< Amplitude the motor has, -1 = unknown (stop it first)
++	uint8_t sent;         //!< Amplitude of the write in flight
++	bool in_flight;
++	timepoint_ns sent_ns, refresh_ns, retry_ns;
++
++	/* Counters for the status file */
++	uint64_t writes, failed;
++	double last_rtt_ms;
++};
++
+ /* Structure to track online devices and type */
+ struct rift_s_tracked_device
+ {
+@@ -92,6 +119,12 @@ struct rift_s_system
+ 	/* Radio comms manager */
+ 	rift_s_radio_state radio_state;
+ 
++	/* Controller vibration, indexed like controllers[] */
++	struct os_mutex haptic_mutex;
++	struct rift_s_haptic haptics[MAX_TRACKED_DEVICES];
++	int haptic_turn;
++	FILE *haptic_log; //!< RIFT_S_HAPTICS_LOG, NULL = off
++
+ 	/* Device lock protects device access */
+ 	struct os_mutex dev_mutex;
+ 
+@@ -143,6 +176,13 @@ rift_s_system_get_controller(struct rift_s_system *sys, int index);
+ void
+ rift_s_system_remove_controller(struct rift_s_system *sys, struct rift_s_controller *ctrl);
+ 
++/*!
++ * Request a vibration on controller @p hand (0 = left, 1 = right), amplitude 0 stops it.
++ * Called from any thread, the radio write happens on the USB thread.
++ */
++xrt_result_t
++rift_s_system_set_haptic(struct rift_s_system *sys, int hand, const struct xrt_output_value_vibration *value);
++
+ struct xrt_device *
+ rift_s_system_get_hand_tracking_device(struct rift_s_system *sys);
+ 
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index 6a7f0fe..83baef0 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -810,6 +810,19 @@ rift_s_controller_get_battery_status(struct xrt_device *xdev, bool *out_present,
+ 	return XRT_SUCCESS;
+ }
+ 
++static xrt_result_t
++rift_s_controller_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
++{
++	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
++
++	if (name != XRT_OUTPUT_NAME_TOUCH_HAPTIC || value->type != XRT_OUTPUT_VALUE_TYPE_VIBRATION) {
++		return XRT_ERROR_OUTPUT_UNSUPPORTED;
++	}
++
++	int hand = ctrl->base.device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ? 1 : 0;
++	return rift_s_system_set_haptic(ctrl->sys, hand, &value->vibration);
++}
++
+ static void
+ rift_s_controller_destroy(struct xrt_device *xdev)
+ {
+@@ -1104,6 +1117,7 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
+ 
+ 	u_device_populate_function_pointers(&ctrl->base, rift_s_controller_get_tracked_pose, rift_s_controller_destroy);
+ 	ctrl->base.update_inputs = rift_s_controller_update_inputs;
++	ctrl->base.set_output = rift_s_controller_set_output;
+ 	ctrl->base.get_view_poses = u_device_get_view_poses;
+ 	ctrl->base.name = XRT_DEVICE_TOUCH_CONTROLLER;
+ 	ctrl->base.device_type = device_type;
+diff --git a/src/xrt/drivers/rift_s/rift_s_radio.c b/src/xrt/drivers/rift_s/rift_s_radio.c
+index 9b31cf8..973711b 100644
+--- a/src/xrt/drivers/rift_s/rift_s_radio.c
++++ b/src/xrt/drivers/rift_s/rift_s_radio.c
+@@ -33,7 +33,7 @@ struct rift_s_radio_command
+ 	rift_s_radio_command *prev;
+ 	rift_s_radio_command *next;
+ 
+-	/* Request packet data */
++	/* Request packet data, read_command.cmd is the HID report (0x12 read, 0x13 write) */
+ 	rift_s_hmd_radio_command_t read_command;
+ 
+ 	/* Completion callback */
+@@ -64,7 +64,6 @@ rift_s_radio_update(rift_s_radio_state *state, struct os_hid_device *hid)
+ 			rift_s_radio_command *cmd = state->pending_commands;
+ 			rift_s_hmd_radio_command_t *pkt = &cmd->read_command;
+ 
+-			pkt->cmd = 0x12;
+ 			os_hid_set_feature(hid, (uint8_t *)pkt, sizeof(*pkt));
+ 			// rift_s_hexdump_buffer ("ControllerFWSend", (unsigned char *)(pkt), sizeof(*pkt));
+ 			state->command_result_pending = true;
+@@ -144,17 +143,40 @@ rift_s_radio_state_clear(rift_s_radio_state *state)
+ }
+ 
+ void
+-rift_s_radio_queue_command(rift_s_radio_state *state,
+-                           const uint64_t device_id,
+-                           const uint8_t *cmd_bytes,
+-                           const int cmd_bytes_len,
+-                           rift_s_radio_completion_fn cb,
+-                           void *cb_data)
++rift_s_radio_state_drop_queued(rift_s_radio_state *state)
++{
++	/* Keep the command the radio is busy with, so its reply isn't taken for the next one */
++	rift_s_radio_command *keep = state->command_result_pending ? state->pending_commands : NULL;
++	rift_s_radio_command *head = keep != NULL ? keep->next : state->pending_commands;
++
++	while (head != NULL) {
++		rift_s_radio_command *prev = head;
++		head = prev->next;
++
++		if (prev->cb)
++			prev->cb(false, NULL, 0, prev->cb_data);
++		free(prev);
++	}
++
++	if (keep != NULL)
++		keep->next = NULL;
++	state->pending_commands = state->pending_commands_tail = keep;
++}
++
++static void
++queue_report(rift_s_radio_state *state,
++             uint8_t report_id,
++             const uint64_t device_id,
++             const uint8_t *cmd_bytes,
++             const int cmd_bytes_len,
++             rift_s_radio_completion_fn cb,
++             void *cb_data)
+ {
+ 	rift_s_radio_command *cmd = U_TYPED_CALLOC(rift_s_radio_command);
+ 
+ 	assert(cmd_bytes_len <= (int)sizeof(cmd->read_command.cmd_bytes));
+ 
++	cmd->read_command.cmd = report_id;
+ 	cmd->read_command.device_id = device_id;
+ 	memcpy(cmd->read_command.cmd_bytes, cmd_bytes, cmd_bytes_len);
+ 	cmd->cb = cb;
+@@ -172,6 +194,28 @@ rift_s_radio_queue_command(rift_s_radio_state *state,
+ 	}
+ }
+ 
++void
++rift_s_radio_queue_command(rift_s_radio_state *state,
++                           const uint64_t device_id,
++                           const uint8_t *cmd_bytes,
++                           const int cmd_bytes_len,
++                           rift_s_radio_completion_fn cb,
++                           void *cb_data)
++{
++	queue_report(state, 0x12, device_id, cmd_bytes, cmd_bytes_len, cb, cb_data);
++}
++
++void
++rift_s_radio_queue_write(rift_s_radio_state *state,
++                         const uint64_t device_id,
++                         const uint8_t *cmd_bytes,
++                         const int cmd_bytes_len,
++                         rift_s_radio_completion_fn cb,
++                         void *cb_data)
++{
++	queue_report(state, 0x13, device_id, cmd_bytes, cmd_bytes_len, cb, cb_data);
++}
++
+ /* The current blocks are ~2-3KB, so this should be enough to read
+  * the JSON config: */
+ #define MAX_JSON_LEN 4096
+diff --git a/src/xrt/drivers/rift_s/rift_s_radio.h b/src/xrt/drivers/rift_s/rift_s_radio.h
+index a16cebf..8c7fc7d 100644
+--- a/src/xrt/drivers/rift_s/rift_s_radio.h
++++ b/src/xrt/drivers/rift_s/rift_s_radio.h
+@@ -60,6 +60,17 @@ rift_s_radio_queue_command(rift_s_radio_state *state,
+                            const int cmd_bytes_len,
+                            rift_s_radio_completion_fn cb,
+                            void *cb_data);
++//! Like rift_s_radio_queue_command, but writes a controller register (report 0x13)
++void
++rift_s_radio_queue_write(rift_s_radio_state *state,
++                         const uint64_t device_id,
++                         const uint8_t *cmd_bytes,
++                         const int cmd_bytes_len,
++                         rift_s_radio_completion_fn cb,
++                         void *cb_data);
++//! Fail and free all queued commands except the one the radio is busy with
++void
++rift_s_radio_state_drop_queued(rift_s_radio_state *state);
+ void
+ rift_s_radio_get_json_block(rift_s_radio_state *state,
+                             const uint64_t device_id,
+-- 
+2.54.0
+

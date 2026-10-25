@@ -1,0 +1,86 @@
+From 0b484359b975130a07f6f15f71518b5b4c76c6a0 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:28:50 +0200
+Subject: [PATCH] d/rift_s: Merge one frame's vibration requests, keep the
+ minimum pulse
+
+Logged in Half-Life: Alyx (6 min, via xrizer): it sends several requests
+per frame (one per effect, <0.1 ms apart, e.g. 0.75 then 0.14 then 0.08)
+and 11 ms pulses (one frame at 90 Hz) every frame; Monado stops each
+pulse when its duration expires. With last-request-wins and stops cutting
+the pulse, the strong effects were lost and at ~38 fps the motor switched
+off every frame.
+
+Requests within 3 ms are merged (strongest wins), stops can't end a pulse
+before RIFT_S_HAPTICS_MIN_MS, now 40 ms. Replaying the log: ~1.9x the
+vibration (strength x time), half the motor on/off switches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s.c | 25 +++++++++++++++++++++----
+ src/xrt/drivers/rift_s/rift_s.h |  1 +
+ 2 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s.c b/src/xrt/drivers/rift_s/rift_s.c
+index a8e29ea..49dd3e5 100644
+--- a/src/xrt/drivers/rift_s/rift_s.c
++++ b/src/xrt/drivers/rift_s/rift_s.c
+@@ -64,13 +64,16 @@ DEBUG_GET_ONCE_OPTION(rift_s_status_file, "RIFT_S_STATUS_FILE", NULL)
+ 
+ //! Scales controller vibration strength (0..1 from the application), 0 disables vibration
+ DEBUG_GET_ONCE_FLOAT_OPTION(rift_s_haptics_scale, "RIFT_S_HAPTICS_SCALE", 1.0f)
+-//! Shortest vibration: games send 1-4 ms pulses every frame, shorter would toggle the motor between frames
+-DEBUG_GET_ONCE_NUM_OPTION(rift_s_haptics_min_ms, "RIFT_S_HAPTICS_MIN_MS", 20)
++//! Shortest vibration. Games send one-frame pulses every frame (Alyx: 11 ms, one frame at 90 Hz) and
++//! the runtime stops each one when it expires; at our ~38 fps shorter would switch the motor off every frame
++DEBUG_GET_ONCE_NUM_OPTION(rift_s_haptics_min_ms, "RIFT_S_HAPTICS_MIN_MS", 40)
+ //! CSV log of the applications' vibration requests (before scaling / stretching), for tuning
+ DEBUG_GET_ONCE_OPTION(rift_s_haptics_log, "RIFT_S_HAPTICS_LOG", NULL)
+ 
+ //! Longest single request, so a client that dies mid-vibration can't leave a motor running
+ #define HAPTIC_MAX_DURATION_NS (10LL * U_TIME_1S_IN_NS)
++//! Requests this close together are one frame's effects (Alyx sends several per frame): keep the strongest
++#define HAPTIC_MERGE_NS (3 * U_TIME_1MS_IN_NS)
+ //! Wait before retrying a failed motor write
+ #define HAPTIC_RETRY_NS (20 * U_TIME_1MS_IN_NS)
+ static void
+@@ -362,8 +365,22 @@ rift_s_system_set_haptic(struct rift_s_system *sys, int hand, const struct xrt_o
+ 	timepoint_ns now = os_monotonic_get_ns();
+ 
+ 	os_mutex_lock(&sys->haptic_mutex);
+-	h->amplitude = raw;
+-	h->end_ns = raw == 0 ? 0 : now + duration_ns;
++	if (raw == 0) {
++		// Stop, but not before the minimum pulse: Monado stops every pulse when its duration is over,
++		// that must not cut it below what the motor can play
++		timepoint_ns earliest = h->start_ns + min_ns;
++		if (h->end_ns > now) {
++			h->end_ns = earliest > now ? MIN(h->end_ns, earliest) : now;
++		}
++	} else if (now - h->start_ns < HAPTIC_MERGE_NS && now < h->end_ns) {
++		// Same frame as the previous request: OpenXR would replace it, but here it's another effect
++		h->amplitude = MAX(h->amplitude, raw);
++		h->end_ns = MAX(h->end_ns, now + duration_ns);
++	} else {
++		h->start_ns = now;
++		h->amplitude = raw;
++		h->end_ns = now + duration_ns;
++	}
+ 	if (sys->haptic_log != NULL) {
+ 		fprintf(sys->haptic_log, "%.3f,%s,%.3f,%.3f,%.1f\n", (double)now / U_TIME_1MS_IN_NS,
+ 		        hand == 0 ? "L" : "R", value->amplitude, (double)value->duration_ns / U_TIME_1MS_IN_NS,
+diff --git a/src/xrt/drivers/rift_s/rift_s.h b/src/xrt/drivers/rift_s/rift_s.h
+index 57957ec..667633a 100644
+--- a/src/xrt/drivers/rift_s/rift_s.h
++++ b/src/xrt/drivers/rift_s/rift_s.h
+@@ -81,6 +81,7 @@ struct rift_s_haptic
+ 
+ 	/* Requested by the application (set_output), protected by haptic_mutex */
+ 	uint8_t amplitude;
++	timepoint_ns start_ns; //!< First request of the current pulse
+ 	timepoint_ns end_ns;
+ 
+ 	/* Radio side, only touched by the USB thread */
+-- 
+2.54.0
+

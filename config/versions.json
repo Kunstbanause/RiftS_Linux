@@ -1,0 +1,23 @@
+{
+  "monado": {
+    "repo": "https://gitlab.freedesktop.org/thaytan/monado.git",
+    "branch": "dev-constellation-controller-tracking",
+    "commit": "b1c850a015d2d3776414b31168e8f135990c0d8f"
+  },
+  "xrizer": {
+    "repo": "https://github.com/Supreeeme/xrizer.git",
+    "commit": "0519ded7421e608805d710be01fdc51303eda16a",
+    "prebuilt": {"url": "", "sha256": ""}
+  },
+  "wayvr": {
+    "version": "v26.8.0",
+    "appimage": {
+      "url": "https://github.com/wayvr-org/wayvr/releases/download/v26.8.0/WayVR-v26.8.0-x86_64.AppImage",
+      "sha256": "4b40719a860138cde4b97a5acbe5d5c300e9c7a186ab6bed423be8768e0c0794"
+    },
+    "wayvrctl": {
+      "url": "https://github.com/wayvr-org/wayvr/releases/download/v26.8.0/wayvrctl",
+      "sha256": "09acb04d22f5f2bbc5f735db8efaf0f5546f232cdd21fc2e3b9e0610ee6f5b56"
+    }
+  }
+}

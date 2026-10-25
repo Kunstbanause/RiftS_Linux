@@ -1,0 +1,541 @@
+From 51de22d43f1aa2a74e1a6e3299c51af8da88e717 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:48:31 +0200
+Subject: [PATCH] d/rift_s, t/constellation: Record tracker diagnostics with
+ controller fixes
+
+To tell system load from tracking problems, record what the
+constellation tracker did for every fix and how busy it is:
+
+- t_constellation_pose_info (search path that found the pose, camera
+  view, matched / visible LEDs, reprojection error, time found) passed
+  to an optional push_observed_pose_info callback; WMR keeps using
+  push_observed_pose.
+- t_constellation_tracker_get_stats(): frames received vs processed
+  (the fast queue drops frames when the tracker falls behind), full
+  searches requested / superseded / run, last blob / fast / full search
+  durations, blobs per camera.
+
+The Rift S controller optical recording (RIFT_S_CTRL_RECORD) appends the
+pose info, the filter's own pose at the exposure time before the fix,
+chi2 / innovation and the head pose at the exposure; the first ten
+columns are unchanged. A rift_s_tracker_<ns>.csv in the same directory
+gets the tracker counters for every frameset, and the status file a
+"tracker" block with the cumulative counters.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s.c               | 11 +++
+ src/xrt/drivers/rift_s/rift_s_controller.c    | 49 +++++++++--
+ src/xrt/drivers/rift_s/rift_s_tracker.c       | 49 +++++++++++
+ src/xrt/drivers/rift_s/rift_s_tracker.h       |  8 ++
+ .../tracking/t_constellation_tracking.h       | 52 ++++++++++++
+ .../constellation/t_constellation_tracking.c  | 84 ++++++++++++++++---
+ 6 files changed, 234 insertions(+), 19 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s.c b/src/xrt/drivers/rift_s/rift_s.c
+index a9c119a..3beac32 100644
+--- a/src/xrt/drivers/rift_s/rift_s.c
++++ b/src/xrt/drivers/rift_s/rift_s.c
+@@ -644,6 +644,17 @@ write_status_file(struct rift_s_system *sys, timepoint_ns now)
+ 		        forced ? "true" : "false", streaming ? "true" : "false", frame_age_ms);
+ 	}
+ 
++	struct t_constellation_tracker_stats ts;
++	if (sys->tracker != NULL && rift_s_tracker_get_controller_tracker_stats(sys->tracker, &ts)) {
++		// Cumulative counters, readers derive rates (dropped = received - processed)
++		fprintf(f,
++		        ", \"tracker\": {\"frames_received\": %" PRIu64 ", \"frames_processed\": %" PRIu64
++		        ", \"long_requested\": %" PRIu64 ", \"long_superseded\": %" PRIu64 ", \"long_run\": %" PRIu64
++		        ", \"blob_ms\": %.2f, \"fast_ms\": %.2f, \"long_ms\": %.2f}",
++		        ts.frames_received, ts.frames_processed, ts.long_requested, ts.long_superseded, ts.long_run,
++		        ts.last_blob_ns / 1e6, ts.last_fast_ns / 1e6, ts.last_long_ns / 1e6);
++	}
++
+ 	fprintf(f, ", \"controllers\": {");
+ 
+ 	os_mutex_lock(&sys->dev_mutex);
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index e8eda29..b8ec166 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -890,9 +890,20 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
+ }
+ 
+ static void
+-rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose)
++rift_s_controller_push_observed_pose_info(struct xrt_device *xdev,
++                                          timepoint_ns frame_mono_ns,
++                                          const struct xrt_pose *pose,
++                                          const struct t_constellation_pose_info *info)
+ {
+ 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
++
++	// Head pose at the exposure, for the recording (queried outside the controller lock)
++	struct xrt_space_relation head = XRT_SPACE_RELATION_ZERO;
++	if (ctrl->record_optical != NULL) {
++		rift_s_tracker_get_tracked_pose(rift_s_system_get_tracker(ctrl->sys), RIFT_S_TRACKER_POSE_DEVICE,
++		                                frame_mono_ns, &head);
++	}
++
+ 	os_mutex_lock(&ctrl->mutex);
+ 
+ 	// Only keep strictly newer samples, so the velocity fit never sees time going backwards.
+@@ -907,15 +918,33 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
+ 	ctrl->last_tracked_pose = *pose;
+ 
+ 	if (ctrl->ctrl_fusion != NULL) {
++		// The filter's own pose at the exposure, before this fix is applied
++		struct xrt_space_relation prior = XRT_SPACE_RELATION_ZERO;
++		bool have_prior = ctrl->record_optical != NULL &&
++		                  rift_s_ctrl_fusion_get_relation(ctrl->ctrl_fusion, frame_mono_ns, &prior) &&
++		                  (prior.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
++
+ 		enum rift_s_ctrl_fusion_pose_result res =
+ 		    rift_s_ctrl_fusion_pose(ctrl->ctrl_fusion, frame_mono_ns, pose);
+ 		rift_s_ctrl_fusion_get_stats(ctrl->ctrl_fusion, &ctrl->fusion_stats);
+ 
+ 		if (ctrl->record_optical != NULL) {
+-			fprintf(ctrl->record_optical, "%" PRId64 ",%" PRId64 ",%f,%f,%f,%f,%f,%f,%f,%d\n", frame_mono_ns,
+-			        os_monotonic_get_ns(), pose->position.x, pose->position.y, pose->position.z,
+-			        pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w,
+-			        (int)res);
++			const struct t_constellation_pose_info no_info = {.view_id = -1};
++			const struct t_constellation_pose_info *in = info != NULL ? info : &no_info;
++			const struct xrt_pose *pp = &prior.pose;
++			const struct xrt_pose *hp = &head.pose;
++			fprintf(ctrl->record_optical,
++			        "%" PRId64 ",%" PRId64 ",%f,%f,%f,%f,%f,%f,%f,%d,"
++			        "%d,%d,%d,%d,%.3f,%" PRId64 ",%.3f,%.5f,"
++			        "%d,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f\n",
++			        frame_mono_ns, os_monotonic_get_ns(), pose->position.x, pose->position.y, pose->position.z,
++			        pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w, (int)res,
++			        (int)in->source, in->view_id, in->matched_blobs, in->visible_leds, in->reprojection_error,
++			        in->found_ns, ctrl->fusion_stats.last_chi2, ctrl->fusion_stats.last_pos_innovation,
++			        have_prior ? 1 : 0, pp->position.x, pp->position.y, pp->position.z, pp->orientation.x,
++			        pp->orientation.y, pp->orientation.z, pp->orientation.w, hp->position.x, hp->position.y,
++			        hp->position.z, hp->orientation.x, hp->orientation.y, hp->orientation.z,
++			        hp->orientation.w);
+ 		}
+ 	}
+ 
+@@ -994,8 +1023,12 @@ rift_s_controller_setup_fusion(struct rift_s_controller *ctrl)
+ 		int64_t now = os_monotonic_get_ns();
+ 		ctrl->record_imu = open_record_file(record_dir, side, now, "imu",
+ 		                                    "mono_ns,device_ns,arrival_ns,gx,gy,gz,ax,ay,az");
+-		ctrl->record_optical = open_record_file(record_dir, side, now, "optical",
+-		                                        "frame_ns,arrival_ns,px,py,pz,qx,qy,qz,qw,result");
++		ctrl->record_optical = open_record_file(
++		    record_dir, side, now, "optical",
++		    "frame_ns,arrival_ns,px,py,pz,qx,qy,qz,qw,result,"
++		    "source,view,matched,visible,reproj_px,found_ns,chi2,innov_m,"
++		    "prior_valid,prior_px,prior_py,prior_pz,prior_qx,prior_qy,prior_qz,prior_qw,"
++		    "head_px,head_py,head_pz,head_qx,head_qy,head_qz,head_qw");
+ 	}
+ 
+ 	struct rift_s_ctrl_fusion_params *p = rift_s_ctrl_fusion_params_ptr(ctrl->ctrl_fusion);
+@@ -1027,7 +1060,7 @@ rift_s_controller_setup_fusion(struct rift_s_controller *ctrl)
+ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
+     .get_led_model = rift_s_controller_get_led_model,
+     .notify_frame_received = NULL,
+-    .push_observed_pose = rift_s_controller_push_observed_pose,
++    .push_observed_pose_info = rift_s_controller_push_observed_pose_info,
+ };
+ 
+ struct rift_s_controller *
+diff --git a/src/xrt/drivers/rift_s/rift_s_tracker.c b/src/xrt/drivers/rift_s/rift_s_tracker.c
+index 09a78e1..6ac51bb 100644
+--- a/src/xrt/drivers/rift_s/rift_s_tracker.c
++++ b/src/xrt/drivers/rift_s/rift_s_tracker.c
+@@ -84,6 +84,9 @@ DEBUG_GET_ONCE_OPTION(slam_submit_from_start, "SLAM_SUBMIT_FROM_START", NULL)
+  */
+ DEBUG_GET_ONCE_NUM_OPTION(rift_s_slam_cams, "RIFT_S_SLAM_CAMS", RIFT_S_CAMERA_COUNT)
+ 
++//! Same directory as the controller recorder (rift_s_controller.c)
++DEBUG_GET_ONCE_OPTION(rift_s_ctrl_record_dir, "RIFT_S_CTRL_RECORD", NULL)
++
+ static int
+ rift_s_slam_cam_count(void)
+ {
+@@ -398,6 +401,22 @@ rift_s_create_constellation_tracker(struct rift_s_tracker *t, struct xrt_frame_c
+ 		return -1;
+ 	}
+ 	t->controller_sink = controller_sink;
++
++	const char *record_dir = debug_get_option_rift_s_ctrl_record_dir();
++	if (record_dir != NULL && record_dir[0] != '\0') {
++		char path[1024];
++		(void)snprintf(path, sizeof(path), "%s/rift_s_tracker_%" PRId64 ".csv", record_dir,
++		               (int64_t)os_monotonic_get_ns());
++		t->record_tracker = fopen(path, "w");
++		if (t->record_tracker == NULL) {
++			RIFT_S_ERROR("Could not open constellation tracker recording file %s", path);
++		} else {
++			fprintf(t->record_tracker,
++			        "frame_ns,arrival_ns,received,processed,long_requested,long_superseded,long_run,"
++			        "blob_ms,fast_ms,long_ms,blobs0,blobs1,blobs2,blobs3,blobs4\n");
++			RIFT_S_INFO("Recording constellation tracker counters to %s", path);
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -584,6 +603,11 @@ rift_s_tracker_destroy(struct rift_s_tracker *t)
+ 	m_imu_3dof_close(&t->fusion.i3dof);
+ 	os_mutex_destroy(&t->mutex);
+ 
++	if (t->record_tracker != NULL) {
++		fclose(t->record_tracker);
++		t->record_tracker = NULL;
++	}
++
+ 	for (int i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
+ 		xrt_frame_reference(&t->passthrough.frames[i], NULL);
+ 	}
+@@ -903,6 +927,31 @@ rift_s_tracker_push_controller_frameset(struct rift_s_tracker *t, uint64_t frame
+ 		frameset->timestamp = frame_mono_ns;
+ 		xrt_sink_push_frame(t->controller_sink, frameset);
+ 	}
++
++	if (t->record_tracker != NULL) {
++		struct t_constellation_tracker_stats st;
++		t_constellation_tracker_get_stats(t->controller_tracker, &st);
++		int b[5] = {0};
++		for (int i = 0; i < st.cam_count && i < 5; i++) {
++			b[i] = st.blobs[i];
++		}
++		fprintf(t->record_tracker,
++		        "%" PRId64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
++		        ",%.2f,%.2f,%.2f,%d,%d,%d,%d,%d\n",
++		        frame_mono_ns, os_monotonic_get_ns(), st.frames_received, st.frames_processed, st.long_requested,
++		        st.long_superseded, st.long_run, st.last_blob_ns / 1e6, st.last_fast_ns / 1e6,
++		        st.last_long_ns / 1e6, b[0], b[1], b[2], b[3], b[4]);
++	}
++}
++
++bool
++rift_s_tracker_get_controller_tracker_stats(struct rift_s_tracker *t, struct t_constellation_tracker_stats *out_stats)
++{
++	if (t->controller_tracker == NULL) {
++		return false;
++	}
++	t_constellation_tracker_get_stats(t->controller_tracker, out_stats);
++	return true;
+ }
+ 
+ //! Specific pose correction for Basalt to OpenXR coordinates
+diff --git a/src/xrt/drivers/rift_s/rift_s_tracker.h b/src/xrt/drivers/rift_s/rift_s_tracker.h
+index 2fc027a..a7ccb96 100644
+--- a/src/xrt/drivers/rift_s/rift_s_tracker.h
++++ b/src/xrt/drivers/rift_s/rift_s_tracker.h
+@@ -15,6 +15,8 @@
+ 
+ #pragma once
+ 
++#include <stdio.h>
++
+ #include "math/m_imu_3dof.h"
+ #include "os/os_threading.h"
+ #include "util/u_var.h"
+@@ -118,6 +120,8 @@ struct rift_s_tracker
+ 	// Constellation tracker
+ 	struct t_constellation_tracker *controller_tracker;
+ 	struct xrt_frame_sink *controller_sink; //!< Sink to send controller frames to tracker
++	//! Per-frameset constellation tracker counters, written while RIFT_S_CTRL_RECORD is set
++	FILE *record_tracker;
+ 
+ 	//! Latest front camera images for passthrough. Own copies, so the camera's buffers are not held.
+ 	struct
+@@ -202,6 +206,10 @@ rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
+ void
+ rift_s_tracker_push_controller_frameset(struct rift_s_tracker *t, uint64_t frame_ts_ns, struct xrt_frame *frameset);
+ 
++//! Constellation tracker counters, false if there is no controller tracker
++bool
++rift_s_tracker_get_controller_tracker_stats(struct rift_s_tracker *t, struct t_constellation_tracker_stats *out_stats);
++
+ void
+ rift_s_tracker_get_tracked_pose(struct rift_s_tracker *t,
+                                 enum rift_s_tracker_pose pose,
+diff --git a/src/xrt/include/tracking/t_constellation_tracking.h b/src/xrt/include/tracking/t_constellation_tracking.h
+index 4319b6e..bc6aeed 100644
+--- a/src/xrt/include/tracking/t_constellation_tracking.h
++++ b/src/xrt/include/tracking/t_constellation_tracking.h
+@@ -70,14 +70,66 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
+                                struct xrt_frame_sink **out_sink,
+                                struct xrt_device_masks_sink *controller_mask_sink);
+ 
++//! Which search strategy produced an observed pose
++enum t_constellation_pose_source
++{
++	T_CONSTELLATION_POSE_FROM_PRIOR = 0,
++	T_CONSTELLATION_POSE_FROM_LAST_SEEN = 1,
++	T_CONSTELLATION_POSE_FROM_LABELLED_BLOBS = 2,
++	T_CONSTELLATION_POSE_FROM_SHALLOW_SEARCH = 3,
++	T_CONSTELLATION_POSE_FROM_DEEP_SEARCH = 4,
++};
++
++//! Details about an observed pose, for recording and diagnostics
++struct t_constellation_pose_info
++{
++	enum t_constellation_pose_source source;
++	//! Camera view the pose was found in
++	int view_id;
++	int matched_blobs;
++	int visible_leds;
++	//! Mean reprojection error per matched LED (px)
++	float reprojection_error;
++	//! Monotonic time the pose was found (latency = found_ns - frame time)
++	timepoint_ns found_ns;
++};
++
+ struct t_constellation_tracked_device_callbacks
+ {
+ 	bool (*get_led_model)(struct xrt_device *xdev, struct t_constellation_led_model *led_model);
+ 	void (*notify_frame_received)(struct xrt_device *xdev, uint64_t frame_mono_ns, uint64_t frame_sequence);
+ 	void (*push_observed_pose)(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose);
++	//! Optional, used instead of push_observed_pose when set
++	void (*push_observed_pose_info)(struct xrt_device *xdev,
++	                                timepoint_ns frame_mono_ns,
++	                                const struct xrt_pose *pose,
++	                                const struct t_constellation_pose_info *info);
+ 	void (*push_brightness_update)(struct xrt_device *xdev, uint8_t average_brightness);
+ };
+ 
++//! Cumulative tracker counters and the latest timings
++struct t_constellation_tracker_stats
++{
++	//! Camera frames handed to the tracker
++	uint64_t frames_received;
++	//! Frames the fast thread analysed (received - processed - queued = dropped)
++	uint64_t frames_processed;
++	//! Full searches requested, replaced by a newer one before they ran, and run
++	uint64_t long_requested;
++	uint64_t long_superseded;
++	uint64_t long_run;
++	//! Duration of the last blob extraction, fast analysis and full search (ns)
++	uint64_t last_blob_ns;
++	uint64_t last_fast_ns;
++	uint64_t last_long_ns;
++	int cam_count;
++	//! Blobs in each camera in the last processed frame
++	int blobs[XRT_TRACKING_MAX_SLAM_CAMS];
++};
++
++void
++t_constellation_tracker_get_stats(struct t_constellation_tracker *ct, struct t_constellation_tracker_stats *out_stats);
++
+ struct t_constellation_tracked_device_connection *
+ t_constellation_tracker_add_device(struct t_constellation_tracker *ct,
+                                    struct xrt_device *xdev,
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracking.c b/src/xrt/tracking/constellation/t_constellation_tracking.c
+index 65e88d8..841e673 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracking.c
++++ b/src/xrt/tracking/constellation/t_constellation_tracking.c
+@@ -178,6 +178,10 @@ struct t_constellation_tracker
+ 
+ 	struct xrt_device_masks_sample controller_masks_sample;
+ 	struct xrt_device_masks_sink *controller_masks_sink;
++
++	//! Counters for t_constellation_tracker_get_stats, protected by stats_lock
++	struct os_mutex stats_lock;
++	struct t_constellation_tracker_stats stats;
+ };
+ 
+ static void
+@@ -195,11 +199,16 @@ constellation_tracked_device_connection_notify_frame(struct t_constellation_trac
+ static void
+ constellation_tracked_device_connection_notify_pose(struct t_constellation_tracked_device_connection *ctdc,
+                                                     timepoint_ns frame_mono_ns,
+-                                                    const struct xrt_pose *pose)
++                                                    const struct xrt_pose *pose,
++                                                    const struct t_constellation_pose_info *info)
+ {
+ 	os_mutex_lock(&ctdc->lock);
+-	if (!ctdc->disconnected && ctdc->cb->push_observed_pose) {
+-		ctdc->cb->push_observed_pose(ctdc->xdev, frame_mono_ns, pose);
++	if (!ctdc->disconnected) {
++		if (ctdc->cb->push_observed_pose_info) {
++			ctdc->cb->push_observed_pose_info(ctdc->xdev, frame_mono_ns, pose, info);
++		} else if (ctdc->cb->push_observed_pose) {
++			ctdc->cb->push_observed_pose(ctdc->xdev, frame_mono_ns, pose);
++		}
+ 	}
+ 	os_mutex_unlock(&ctdc->lock);
+ }
+@@ -264,6 +273,11 @@ constellation_tracker_receive_frame(struct xrt_frame_sink *sink, struct xrt_fram
+ 	os_mutex_unlock(&ct->tracked_device_lock);
+ 
+ 	ct->last_frame_timestamp = xf->timestamp;
++
++	os_mutex_lock(&ct->stats_lock);
++	ct->stats.frames_received++;
++	os_mutex_unlock(&ct->stats_lock);
++
+ 	xrt_sink_push_frame(ct->fast_q_sink, xf);
+ }
+ 
+@@ -322,7 +336,8 @@ submit_device_pose(struct t_constellation_tracker *ct,
+                    struct tracking_sample_device_state *dev_state,
+                    struct constellation_tracking_sample *sample,
+                    int view_id,
+-                   struct xrt_pose *P_cam_obj)
++                   struct xrt_pose *P_cam_obj,
++                   enum t_constellation_pose_source source)
+ {
+ 	struct constellation_tracker_camera_state *cam = ct->cam + view_id;
+ 	struct tracking_sample_frame *view = sample->views + view_id;
+@@ -456,8 +471,18 @@ submit_device_pose(struct t_constellation_tracker *ct,
+ 		constellation_tracked_device_connection_notify_brightness_update(device->connection,
+ 		                                                                 average_brightness);
+ 
++		struct t_constellation_pose_info info = {
++		    .source = source,
++		    .view_id = view_id,
++		    .matched_blobs = score->matched_blobs,
++		    .visible_leds = score->visible_leds,
++		    .reprojection_error = score->matched_blobs > 0
++		                              ? (float)(score->reprojection_error / score->matched_blobs)
++		                              : 0.0f,
++		    .found_ns = (timepoint_ns)os_monotonic_get_ns(),
++		};
+ 		constellation_tracked_device_connection_notify_pose(device->connection, sample->timestamp,
+-		                                                    &P_xrworld_device);
++		                                                    &P_xrworld_device, &info);
+ 
+ 		// update the controller masks for this controller
+ 		if (ct->controller_masks_sink) {
+@@ -505,7 +530,8 @@ static bool
+ device_try_global_pose(struct t_constellation_tracker *ct,
+                        struct tracking_sample_device_state *dev_state,
+                        struct constellation_tracking_sample *sample,
+-                       struct xrt_pose *P_world_obj_candidate)
++                       struct xrt_pose *P_world_obj_candidate,
++                       enum t_constellation_pose_source source)
+ {
+ 	bool ret = false;
+ 	for (int view_id = 0; view_id < sample->n_views; view_id++) {
+@@ -531,7 +557,7 @@ device_try_global_pose(struct t_constellation_tracker *ct,
+ 		                                      &cam->camera_model, NULL);
+ 
+ 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
+-			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj_candidate);
++			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj_candidate, source);
+ 			ret = true;
+ 		}
+ 	}
+@@ -604,7 +630,8 @@ device_try_recover_pose(struct t_constellation_tracker *ct,
+ 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
+ 			CT_DEBUG(ct, "Camera %d RANSAC-PnP recovered pose for device %d from %u blobs", view_id,
+ 			         leds_model->id, num_blobs);
+-			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj);
++			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
++			                   T_CONSTELLATION_POSE_FROM_LABELLED_BLOBS);
+ 			return true;
+ 		}
+ 		CT_DEBUG(ct,
+@@ -776,13 +803,15 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
+ 
+ 		CT_DEBUG(ct, "Doing fast match search for device %d", device->led_model.id);
+ 
+-		if (device_try_global_pose(ct, dev_state, sample, &dev_state->P_world_obj_prior)) {
++		if (device_try_global_pose(ct, dev_state, sample, &dev_state->P_world_obj_prior,
++		                           T_CONSTELLATION_POSE_FROM_PRIOR)) {
+ 			CT_DEBUG(ct, "Found fast match search for device %d in view %d from prior pose",
+ 			         device->led_model.id, dev_state->found_pose_view_id);
+ 			continue;
+ 		}
+ 		if (dev_state->have_last_seen_pose &&
+-		    device_try_global_pose(ct, dev_state, sample, &dev_state->last_seen_pose)) {
++		    device_try_global_pose(ct, dev_state, sample, &dev_state->last_seen_pose,
++		                           T_CONSTELLATION_POSE_FROM_LAST_SEEN)) {
+ 			CT_DEBUG(ct, "Found fast match search for device %d in view %d from last_seen pose",
+ 			         device->led_model.id, dev_state->found_pose_view_id);
+ 			continue;
+@@ -800,6 +829,16 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
+ 	uint64_t fast_analysis_finish_ts = os_monotonic_get_ns();
+ 	ct->last_fast_analysis_ms = (fast_analysis_finish_ts - fast_analysis_start_ts) / U_TIME_1MS_IN_NS;
+ 
++	os_mutex_lock(&ct->stats_lock);
++	ct->stats.frames_processed++;
++	ct->stats.last_blob_ns = blob_extract_finish_ts - fast_analysis_start_ts;
++	ct->stats.last_fast_ns = fast_analysis_finish_ts - fast_analysis_start_ts;
++	ct->stats.cam_count = ct->cam_count;
++	for (int i = 0; i < ct->cam_count; i++) {
++		ct->stats.blobs[i] = ct->cam[i].last_num_blobs;
++	}
++	os_mutex_unlock(&ct->stats_lock);
++
+ 	/* Send analysis results to debug view if needed */
+ 	enum debug_draw_flag debug_flags = DEBUG_DRAW_FLAG_NONE;
+ 	if (ct->debug_draw_normalise)
+@@ -854,6 +893,12 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
+ 
+ 		/* Send the sample for long analysis */
+ 		os_thread_helper_lock(&ct->long_analysis_thread);
++		os_mutex_lock(&ct->stats_lock);
++		ct->stats.long_requested++;
++		if (ct->long_analysis_pending_sample != NULL) {
++			ct->stats.long_superseded++;
++		}
++		os_mutex_unlock(&ct->stats_lock);
+ 		if (ct->long_analysis_pending_sample != NULL) {
+ 			constellation_tracking_sample_free(ct->long_analysis_pending_sample);
+ 		}
+@@ -921,7 +966,9 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
+ 				        &view->cam_gravity_vector, dev_state->gravity_error_rad, &dev_state->score)) {
+ 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
+ 					         device->led_model.id, pass);
+-					submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj);
++					submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
++					                   pass == 0 ? T_CONSTELLATION_POSE_FROM_SHALLOW_SEARCH
++					                             : T_CONSTELLATION_POSE_FROM_DEEP_SEARCH);
+ 					dev_found[d] = true;
+ 					break;
+ 				}
+@@ -986,6 +1033,11 @@ constellation_tracking_long_analysis_thread(void *ptr)
+ 
+ 			ct->last_long_analysis_ms =
+ 			    (long_analysis_finish_ts - long_analysis_start_ts) / U_TIME_1MS_IN_NS;
++
++			os_mutex_lock(&ct->stats_lock);
++			ct->stats.long_run++;
++			ct->stats.last_long_ns = long_analysis_finish_ts - long_analysis_start_ts;
++			os_mutex_unlock(&ct->stats_lock);
+ 		}
+ 
+ 		os_thread_helper_lock(&ct->long_analysis_thread);
+@@ -1024,6 +1076,7 @@ constellation_tracker_node_destroy(struct xrt_frame_node *node)
+ 	}
+ 	os_mutex_unlock(&ct->tracked_device_lock);
+ 	os_mutex_destroy(&ct->tracked_device_lock);
++	os_mutex_destroy(&ct->stats_lock);
+ 
+ 	/* Clean up any pending sample */
+ 	os_thread_helper_lock(&ct->long_analysis_thread);
+@@ -1074,6 +1127,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
+ 
+ 	int ret;
+ 	struct t_constellation_tracker *ct = calloc(1, sizeof(struct t_constellation_tracker));
++	os_mutex_init(&ct->stats_lock);
+ 
+ 	ct->log_level = debug_get_log_option_ct_log();
+ 	ct->debug_draw_blob_tint = true;
+@@ -1229,6 +1283,14 @@ constellation_tracked_device_connection_create(int id,
+ 	return ctdc;
+ }
+ 
++void
++t_constellation_tracker_get_stats(struct t_constellation_tracker *ct, struct t_constellation_tracker_stats *out_stats)
++{
++	os_mutex_lock(&ct->stats_lock);
++	*out_stats = ct->stats;
++	os_mutex_unlock(&ct->stats_lock);
++}
++
+ struct t_constellation_tracked_device_connection *
+ t_constellation_tracker_add_device(struct t_constellation_tracker *ct,
+                                    struct xrt_device *xdev,
+-- 
+2.54.0
+

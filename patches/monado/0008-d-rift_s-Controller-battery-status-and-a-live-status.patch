@@ -1,0 +1,312 @@
+From 27d7b9b12f7fbd7ea86147dcf91ae4cf6cb1a538 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 21:49:01 +0200
+Subject: [PATCH] d/rift_s: Controller battery status and a live status file
+
+Report the controller battery via xrt_device::get_battery_status. The
+0x08 controller block carries the AA charge in percent (10 % steps,
+0x50 = 80 % with fresh batteries).
+
+Write a small JSON snapshot of the HMD pose and the per-controller link
+and tracking state (report / IMU / optical fix age, fusion state and
+counters, battery) every 250 ms to $XDG_RUNTIME_DIR/monado-rift-s-status.json,
+for external status tools that must not connect as OpenXR clients.
+RIFT_S_STATUS_FILE overrides the path, empty disables it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s.c            | 112 +++++++++++++++++++++
+ src/xrt/drivers/rift_s/rift_s.h            |   5 +
+ src/xrt/drivers/rift_s/rift_s_controller.c |  48 +++++++++
+ src/xrt/drivers/rift_s/rift_s_controller.h |  22 ++++
+ 4 files changed, 187 insertions(+)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s.c b/src/xrt/drivers/rift_s/rift_s.c
+index b79b828..6f52f75 100644
+--- a/src/xrt/drivers/rift_s/rift_s.c
++++ b/src/xrt/drivers/rift_s/rift_s.c
+@@ -28,12 +28,15 @@
+ #include <stdio.h>
+ #include <time.h>
+ #include <assert.h>
++#include <inttypes.h>
++#include <unistd.h>
+ 
+ #include "math/m_api.h"
+ #include "math/m_vec3.h"
+ 
+ #include "os/os_time.h"
+ 
++#include "util/u_debug.h"
+ #include "util/u_device.h"
+ #include "util/u_distortion_mesh.h"
+ #include "util/u_trace_marker.h"
+@@ -52,6 +55,11 @@
+ 
+ static void *
+ rift_s_run_thread(void *ptr);
++
++DEBUG_GET_ONCE_OPTION(rift_s_status_file, "RIFT_S_STATUS_FILE", NULL)
++
++//! Status file update interval
++#define STATUS_INTERVAL_MS 250
+ static void
+ rift_s_system_free(struct rift_s_system *sys);
+ 
+@@ -197,6 +205,15 @@ rift_s_system_create(struct xrt_prober *xp,
+ 		RIFT_S_ERROR("Failed to init device mutex");
+ 		goto cleanup;
+ 	}
++
++	/* Status file: RIFT_S_STATUS_FILE=<path>, empty to disable, default in XDG_RUNTIME_DIR */
++	const char *status_path = debug_get_option_rift_s_status_file();
++	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
++	if (status_path != NULL) {
++		snprintf(sys->status_path, sizeof(sys->status_path), "%s", status_path);
++	} else if (runtime_dir != NULL) {
++		snprintf(sys->status_path, sizeof(sys->status_path), "%s/monado-rift-s-status.json", runtime_dir);
++	}
+ 	//
+ 	// Thread and other state.
+ 	ret = os_thread_helper_init(&sys->oth);
+@@ -313,6 +330,10 @@ rift_s_system_free(struct rift_s_system *sys)
+ 
+ 	os_mutex_destroy(&sys->dev_mutex);
+ 
++	if (sys->status_path[0] != '\0') {
++		unlink(sys->status_path);
++	}
++
+ 	free(sys);
+ }
+ 
+@@ -564,6 +585,7 @@ handle_packets(struct rift_s_system *sys)
+ 				/* System state packet. Enable the screen if the prox sensor is
+ 				 * triggered. */
+ 				bool prox_sensor = (buf[1] == 0) ? false : true;
++				sys->proximity = prox_sensor;
+ 				os_mutex_lock(&sys->dev_mutex);
+ 				if (sys->hmd != NULL) {
+ 					rift_s_hmd_set_proximity(sys->hmd, prox_sensor);
+@@ -579,6 +601,89 @@ handle_packets(struct rift_s_system *sys)
+ }
+ 
+ 
++static double
++status_age_ms(timepoint_ns now, timepoint_ns ts)
++{
++	return ts == 0 ? -1.0 : (double)(now - ts) / U_TIME_1MS_IN_NS;
++}
++
++/*!
++ * Write a small JSON snapshot of the HMD and controller state, for external status tools.
++ * Written to a temporary file and renamed, so readers never see a partial file.
++ */
++static void
++write_status_file(struct rift_s_system *sys, timepoint_ns now)
++{
++	char tmp_path[sizeof(sys->status_path) + 8];
++	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", sys->status_path);
++
++	FILE *f = fopen(tmp_path, "w");
++	if (f == NULL) {
++		return;
++	}
++
++	fprintf(f, "{\"time_ns\": %" PRId64 ", \"proximity\": %s", now, sys->proximity ? "true" : "false");
++
++	if (sys->tracker != NULL) {
++		struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
++		rift_s_tracker_get_tracked_pose(sys->tracker, RIFT_S_TRACKER_POSE_DEVICE, now, &rel);
++		struct xrt_pose *p = &rel.pose;
++		fprintf(f,
++		        ", \"head\": {\"position_tracked\": %s, \"position\": [%.4f, %.4f, %.4f], "
++		        "\"orientation\": [%.5f, %.5f, %.5f, %.5f]}",
++		        (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) ? "true" : "false",
++		        p->position.x, p->position.y, p->position.z, p->orientation.x, p->orientation.y,
++		        p->orientation.z, p->orientation.w);
++	}
++
++	fprintf(f, ", \"controllers\": {");
++
++	os_mutex_lock(&sys->dev_mutex);
++	for (int i = 0; i < 2; i++) {
++		rift_s_device_type type = i == 0 ? RIFT_S_DEVICE_LEFT_CONTROLLER : RIFT_S_DEVICE_RIGHT_CONTROLLER;
++		struct rift_s_controller *ctrl = sys->controllers[i];
++
++		fprintf(f, "%s\"%s\": ", i == 0 ? "" : ", ", i == 0 ? "left" : "right");
++		if (ctrl == NULL) {
++			fprintf(f, "null");
++			continue;
++		}
++
++		// Seen on the radio link (the list only grows, so this means "ever seen")
++		bool paired = false;
++		for (int d = 0; d < sys->num_active_tracked_devices; d++) {
++			if (sys->tracked_device[d].device_type == type) {
++				paired = true;
++			}
++		}
++
++		struct rift_s_controller_status st;
++		rift_s_controller_get_status(ctrl, now, &st);
++
++		fprintf(f,
++		        "{\"paired\": %s, \"report_age_ms\": %.1f, \"imu_age_ms\": %.1f, \"optical_age_ms\": %.1f, "
++		        "\"battery\": %u, \"fusion_initialised\": %s, \"position_tracked\": %s, "
++		        "\"position\": [%.4f, %.4f, %.4f], \"imu_samples\": %" PRIu64 ", \"fixes_accepted\": %" PRIu64
++		        ", \"fixes_rejected\": %" PRIu64 ", \"fixes_ignored\": %" PRIu64 ", \"resets\": %" PRIu64
++		        ", \"tilt_rejections\": %" PRIu64 ", \"last_innovation_m\": %.4f}",
++		        paired ? "true" : "false", status_age_ms(now, st.last_report_ns),
++		        status_age_ms(now, st.last_imu_ns), status_age_ms(now, st.last_optical_ns), st.battery,
++		        st.fusion_initialised ? "true" : "false", st.position_tracked ? "true" : "false",
++		        st.position.x, st.position.y, st.position.z, st.fusion.imu_samples, st.fusion.poses_accepted,
++		        st.fusion.poses_rejected, st.fusion.poses_ignored, st.fusion.resets, st.fusion.tilt_rejections,
++		        st.fusion.last_pos_innovation);
++	}
++	os_mutex_unlock(&sys->dev_mutex);
++
++	fprintf(f, "}}\n");
++
++	if (fclose(f) == 0) {
++		rename(tmp_path, sys->status_path);
++	} else {
++		unlink(tmp_path);
++	}
++}
++
+ static void *
+ rift_s_run_thread(void *ptr)
+ {
+@@ -605,6 +710,13 @@ rift_s_run_thread(void *ptr)
+ 				rift_s_camera_update(sys->cam, sys->handles[HMD_HID]);
+ 			}
+ 			os_mutex_unlock(&sys->dev_mutex);
++
++			timepoint_ns now = os_monotonic_get_ns();
++			if (sys->status_path[0] != '\0' &&
++			    (now - sys->last_status_write_ns) / U_TIME_1MS_IN_NS >= STATUS_INTERVAL_MS) {
++				write_status_file(sys, now);
++				sys->last_status_write_ns = now;
++			}
+ 		}
+ 
+ 		os_thread_helper_lock(&sys->oth);
+diff --git a/src/xrt/drivers/rift_s/rift_s.h b/src/xrt/drivers/rift_s/rift_s.h
+index 740c165..a9c0ebd 100644
+--- a/src/xrt/drivers/rift_s/rift_s.h
++++ b/src/xrt/drivers/rift_s/rift_s.h
+@@ -111,6 +111,11 @@ struct rift_s_system
+ 	/* Video feed handling */
+ 	struct xrt_frame_context xfctx;
+ 	struct rift_s_camera *cam;
++
++	/* Live status file for external tools (RIFT_S_STATUS_FILE), empty path = disabled */
++	char status_path[256];
++	timepoint_ns last_status_write_ns;
++	bool proximity;
+ };
+ 
+ struct rift_s_system *
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index 6452fdd..822d221 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -729,6 +729,52 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
+ 	return XRT_SUCCESS;
+ }
+ 
++void
++rift_s_controller_get_status(struct rift_s_controller *ctrl,
++                             timepoint_ns now,
++                             struct rift_s_controller_status *out_status)
++{
++	*out_status = (struct rift_s_controller_status){0};
++
++	os_mutex_lock(&ctrl->mutex);
++	out_status->last_imu_ns = ctrl->last_imu_local_time_ns;
++	out_status->last_report_ns = ctrl->last_controls_local_time_ns > ctrl->last_imu_local_time_ns
++	                                 ? ctrl->last_controls_local_time_ns
++	                                 : ctrl->last_imu_local_time_ns;
++	out_status->last_optical_ns = ctrl->last_tracked_pose_ts;
++	out_status->battery = ctrl->mask08;
++
++	if (ctrl->ctrl_fusion != NULL) {
++		struct xrt_space_relation rel;
++		out_status->fusion_initialised = rift_s_ctrl_fusion_is_initialised(ctrl->ctrl_fusion);
++		if (rift_s_ctrl_fusion_get_relation(ctrl->ctrl_fusion, now, &rel)) {
++			out_status->position_tracked =
++			    (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
++			out_status->position = rel.pose.position;
++		}
++		rift_s_ctrl_fusion_get_stats(ctrl->ctrl_fusion, &out_status->fusion);
++	} else if (ctrl->last_tracked_pose_ts != 0) {
++		out_status->position_tracked = true;
++		out_status->position = ctrl->last_tracked_pose.position;
++	}
++	os_mutex_unlock(&ctrl->mutex);
++}
++
++static xrt_result_t
++rift_s_controller_get_battery_status(struct xrt_device *xdev, bool *out_present, bool *out_charging, float *out_charge)
++{
++	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
++
++	os_mutex_lock(&ctrl->mutex);
++	// The 0x08 block carries the AA battery charge in percent, in 10 % steps
++	*out_present = ctrl->last_controls_local_time_ns != 0 && ctrl->mask08 <= 100;
++	*out_charging = false;
++	*out_charge = *out_present ? ctrl->mask08 / 100.0f : 0.0f;
++	os_mutex_unlock(&ctrl->mutex);
++
++	return XRT_SUCCESS;
++}
++
+ static void
+ rift_s_controller_destroy(struct xrt_device *xdev)
+ {
+@@ -982,6 +1028,8 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
+ 
+ 	ctrl->base.supported.orientation_tracking = true;
+ 	ctrl->base.supported.position_tracking = true;
++	ctrl->base.supported.battery_status = true;
++	ctrl->base.get_battery_status = rift_s_controller_get_battery_status;
+ 
+ 
+ 	if (device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.h b/src/xrt/drivers/rift_s/rift_s_controller.h
+index 61c3126..ee68a52 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller.h
+@@ -154,6 +154,28 @@ struct rift_s_controller
+ 	struct rift_s_controller_imu_calibration calibration;
+ };
+ 
++//! Snapshot of a controller's link and tracking state, for the status file
++struct rift_s_controller_status
++{
++	//! Last controls / IMU report from the radio, 0 if none yet
++	timepoint_ns last_report_ns;
++	timepoint_ns last_imu_ns;
++	//! Exposure time of the last optical fix, 0 if none yet
++	timepoint_ns last_optical_ns;
++	//! Raw 0x08 block byte: battery charge in percent (10 % steps)
++	uint8_t battery;
++	bool fusion_initialised;
++	//! Fusion pose has POSITION_TRACKED (fixes recent enough, not holding)
++	bool position_tracked;
++	struct xrt_vec3 position;
++	struct rift_s_ctrl_fusion_stats fusion;
++};
++
++void
++rift_s_controller_get_status(struct rift_s_controller *ctrl,
++                             timepoint_ns now,
++                             struct rift_s_controller_status *out_status);
++
+ struct rift_s_controller *
+ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_type);
+ 
+-- 
+2.54.0
+

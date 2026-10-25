@@ -1,0 +1,4 @@
+__pycache__/
+# compiled dev tools (tools/dev/README.md)
+tools/dev/replay
+tools/dev/hapticsplay

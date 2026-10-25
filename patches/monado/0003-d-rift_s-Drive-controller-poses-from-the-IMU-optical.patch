@@ -1,0 +1,356 @@
+From cec4fd4cbcf3ea9b8ee1a65e585acb7963c795bd Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:27:59 +0200
+Subject: [PATCH 3/7] d/rift_s: Drive controller poses from the IMU + optical
+ fusion filter
+
+- Map controller IMU timestamps into the monotonic clock with a
+  windowed min-skew estimator (as the WMR controllers do) and feed the
+  fusion filter, resetting it on clock discontinuities.
+- Feed optical constellation poses into the filter; the 3DoF yaw nudge
+  is skipped once the filter drives the pose.
+- Answer pose queries (including the constellation tracker's prior
+  lookups at frame time) from the filter's prediction / history.
+- RIFT_S_CTRL_FUSION=0 restores the previous behaviour,
+  RIFT_S_CTRL_RECORD=<dir> records IMU samples and optical poses as CSV.
+- Debug UI: live filter parameters and statistics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_controller.c    | 168 +++++++++++++++++-
+ src/xrt/drivers/rift_s/rift_s_controller.h    |  21 +++
+ .../rift_s/rift_s_controller_fusion.cpp       |  16 ++
+ .../drivers/rift_s/rift_s_controller_fusion.h |   4 +
+ 4 files changed, 202 insertions(+), 7 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index 3367581..2b95203 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -22,11 +22,13 @@
+ #include <assert.h>
+ 
+ #include "math/m_api.h"
++#include "math/m_clock_tracking.h"
+ #include "math/m_space.h"
+ #include "math/m_vec3.h"
+ 
+ #include "os/os_hid.h"
+ 
++#include "util/u_debug.h"
+ #include "util/u_device.h"
+ #include "util/u_time.h"
+ #include "util/u_trace_marker.h"
+@@ -41,6 +43,14 @@
+ /* Set to 1 to print controller states continuously */
+ #define DUMP_CONTROLLER_STATE 0
+ 
++//! Use the IMU + optical fusion filter for the controller pose (0 = optical position + 3DoF IMU)
++DEBUG_GET_ONCE_BOOL_OPTION(rift_s_ctrl_fusion, "RIFT_S_CTRL_FUSION", true)
++//! Directory to record controller IMU samples and optical poses into, as CSV
++DEBUG_GET_ONCE_OPTION(rift_s_ctrl_record, "RIFT_S_CTRL_RECORD", NULL)
++
++//! Approximate controller IMU sample rate, sizes the clock estimator window (1 s)
++#define CTRL_IMU_CLOCK_WINDOW 500
++
+ static struct xrt_binding_input_pair simple_inputs_rift_s[4] = {
+     {XRT_INPUT_SIMPLE_SELECT_CLICK, XRT_INPUT_TOUCH_TRIGGER_VALUE},
+     {XRT_INPUT_SIMPLE_MENU_CLICK, XRT_INPUT_TOUCH_MENU_CLICK},
+@@ -151,6 +161,52 @@ print_controller_state(struct rift_s_controller *ctrl)
+ }
+ #endif
+ 
++/*!
++ * Map the current IMU sample into the monotonic clock and feed it to the
++ * fusion filter (and the recorder). Called with the controller mutex held,
++ * after ctrl->gyro / ctrl->accel have been updated.
++ */
++static void
++feed_fusion_imu(struct rift_s_controller *ctrl, timepoint_ns local_ts)
++{
++	if (ctrl->imu_clock == NULL) {
++		return;
++	}
++
++	timepoint_ns device_ns = ctrl->last_imu_device_time_ns;
++	m_clock_windowed_skew_tracker_push(ctrl->imu_clock, local_ts, device_ns);
++
++	timepoint_ns mono_ns;
++	if (!m_clock_windowed_skew_tracker_to_local(ctrl->imu_clock, device_ns, &mono_ns)) {
++		return; // Clock estimator not synchronised yet
++	}
++	mono_ns += (timepoint_ns)ctrl->imu_time_offset_us * OS_NS_PER_USEC;
++
++	if (ctrl->last_imu_mono_ns != 0 && mono_ns <= ctrl->last_imu_mono_ns) {
++		if (ctrl->last_imu_mono_ns - mono_ns > 100 * U_TIME_1MS_IN_NS) {
++			// Controller clock jumped (e.g. power save), start the clock estimate again
++			RIFT_S_WARN("Controller %016" PRIx64 " IMU time went backward, resetting clock tracking",
++			            ctrl->device_id);
++			m_clock_windowed_skew_tracker_reset(ctrl->imu_clock);
++			ctrl->last_imu_mono_ns = 0;
++			if (ctrl->ctrl_fusion != NULL) {
++				rift_s_ctrl_fusion_reset(ctrl->ctrl_fusion);
++			}
++		}
++		return;
++	}
++	ctrl->last_imu_mono_ns = mono_ns;
++
++	if (ctrl->record_imu != NULL) {
++		fprintf(ctrl->record_imu, "%" PRId64 ",%" PRId64 ",%" PRId64 ",%f,%f,%f,%f,%f,%f\n", mono_ns, device_ns,
++		        local_ts, ctrl->gyro.x, ctrl->gyro.y, ctrl->gyro.z, ctrl->accel.x, ctrl->accel.y, ctrl->accel.z);
++	}
++
++	if (ctrl->ctrl_fusion != NULL) {
++		rift_s_ctrl_fusion_imu(ctrl->ctrl_fusion, mono_ns, &ctrl->gyro, &ctrl->accel);
++	}
++}
++
+ static void
+ handle_imu_update(struct rift_s_controller *ctrl,
+                   timepoint_ns local_ts,
+@@ -206,6 +262,8 @@ handle_imu_update(struct rift_s_controller *ctrl,
+ 	m_imu_3dof_update(&ctrl->fusion, ctrl->last_imu_device_time_ns, &ctrl->accel, &ctrl->gyro);
+ 	ctrl->pose.orientation = ctrl->fusion.rot;
+ 
++	feed_fusion_imu(ctrl, local_ts);
++
+ #if 0
+ 	RIFT_S_DEBUG("%" PRIx64 " dt %u device time %u ns %" PRIu64
+ 	             " raw accel %d %d %d gyro %d %d %d -> accel %f %f %f  gyro %f %f %f\n",
+@@ -644,12 +702,17 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
+ 	/* Apply the fusion rotation */
+ 	struct xrt_space_relation *rel = m_relation_chain_reserve(&xrc);
+ 
+-	rift_s_controller_get_fusion_pose(ctrl, name, at_timestamp_ns, rel);
+-	if (ctrl->last_tracked_pose_ts != 0) {
+-		rel->pose.position = ctrl->last_tracked_pose.position;
+-		rel->linear_velocity = rift_s_controller_estimate_linear_velocity(ctrl, os_monotonic_get_ns());
+-		rel->relation_flags |=(enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
+-		                                                       XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
++	// Prefer the 6DoF fusion: IMU pose predicted / interpolated to the requested time
++	bool have_fusion_pose = ctrl->use_fusion && ctrl->ctrl_fusion != NULL &&
++	                        rift_s_ctrl_fusion_get_relation(ctrl->ctrl_fusion, at_timestamp_ns, rel);
++	if (!have_fusion_pose) {
++		rift_s_controller_get_fusion_pose(ctrl, name, at_timestamp_ns, rel);
++		if (ctrl->last_tracked_pose_ts != 0) {
++			rel->pose.position = ctrl->last_tracked_pose.position;
++			rel->linear_velocity = rift_s_controller_estimate_linear_velocity(ctrl, os_monotonic_get_ns());
++			rel->relation_flags |= (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
++			                                                       XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
++		}
+ 	}
+ 	os_mutex_unlock(&ctrl->mutex);
+ 
+@@ -683,6 +746,18 @@ rift_s_controller_destroy(struct xrt_device *xdev)
+ 
+ 	m_imu_3dof_close(&ctrl->fusion);
+ 
++	rift_s_ctrl_fusion_destroy(&ctrl->ctrl_fusion);
++	if (ctrl->imu_clock != NULL) {
++		m_clock_windowed_skew_tracker_destroy(ctrl->imu_clock);
++		ctrl->imu_clock = NULL;
++	}
++	if (ctrl->record_imu != NULL) {
++		fclose(ctrl->record_imu);
++	}
++	if (ctrl->record_optical != NULL) {
++		fclose(ctrl->record_optical);
++	}
++
+ 	os_mutex_destroy(&ctrl->mutex);
+ 
+ 	u_device_free(&ctrl->base);
+@@ -744,7 +819,23 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
+ 	ctrl->last_tracked_pose_ts = frame_mono_ns;
+ 	ctrl->last_tracked_pose = *pose;
+ 
+-	if (ctrl->update_yaw_from_optical) {
++	bool fusion_active = false;
++	if (ctrl->ctrl_fusion != NULL) {
++		enum rift_s_ctrl_fusion_pose_result res =
++		    rift_s_ctrl_fusion_pose(ctrl->ctrl_fusion, frame_mono_ns, pose);
++		rift_s_ctrl_fusion_get_stats(ctrl->ctrl_fusion, &ctrl->fusion_stats);
++		fusion_active = ctrl->use_fusion && rift_s_ctrl_fusion_is_initialised(ctrl->ctrl_fusion);
++
++		if (ctrl->record_optical != NULL) {
++			fprintf(ctrl->record_optical, "%" PRId64 ",%" PRId64 ",%f,%f,%f,%f,%f,%f,%f,%d\n", frame_mono_ns,
++			        os_monotonic_get_ns(), pose->position.x, pose->position.y, pose->position.z,
++			        pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w,
++			        (int)res);
++		}
++	}
++
++	// The 3DoF yaw nudging is only needed when the fusion filter isn't driving the pose
++	if (ctrl->update_yaw_from_optical && !fusion_active) {
+ 		// Apply 5% of observed orientation yaw to 3dof fusion
+ 		// FIXME: Do better
+ 		struct xrt_quat delta;
+@@ -786,6 +877,67 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
+ 	os_mutex_unlock(&ctrl->mutex);
+ }
+ 
++static FILE *
++open_record_file(const char *dir, const char *side, int64_t start_ns, const char *kind, const char *header)
++{
++	char path[1024];
++	(void)snprintf(path, sizeof(path), "%s/rift_s_%s_%" PRId64 "_%s.csv", dir, side, start_ns, kind);
++	FILE *f = fopen(path, "w");
++	if (f == NULL) {
++		RIFT_S_ERROR("Could not open controller recording file %s", path);
++		return NULL;
++	}
++	fprintf(f, "%s\n", header);
++	RIFT_S_INFO("Recording controller %s data to %s", kind, path);
++	return f;
++}
++
++static void
++rift_s_controller_setup_fusion(struct rift_s_controller *ctrl)
++{
++	ctrl->use_fusion = debug_get_bool_option_rift_s_ctrl_fusion();
++	ctrl->imu_clock = m_clock_windowed_skew_tracker_alloc(CTRL_IMU_CLOCK_WINDOW);
++
++	struct rift_s_ctrl_fusion_params params;
++	rift_s_ctrl_fusion_default_params(&params);
++	ctrl->ctrl_fusion = rift_s_ctrl_fusion_create(&params);
++
++	const char *record_dir = debug_get_option_rift_s_ctrl_record();
++	if (record_dir != NULL) {
++		const char *side = ctrl->device_type == RIFT_S_DEVICE_LEFT_CONTROLLER ? "left" : "right";
++		int64_t now = os_monotonic_get_ns();
++		ctrl->record_imu = open_record_file(record_dir, side, now, "imu",
++		                                    "mono_ns,device_ns,arrival_ns,gx,gy,gz,ax,ay,az");
++		ctrl->record_optical = open_record_file(record_dir, side, now, "optical",
++		                                        "frame_ns,arrival_ns,px,py,pz,qx,qy,qz,qw,result");
++	}
++
++	struct rift_s_ctrl_fusion_params *p = rift_s_ctrl_fusion_params_ptr(ctrl->ctrl_fusion);
++	struct rift_s_ctrl_fusion_stats *st = &ctrl->fusion_stats;
++	u_var_add_gui_header(ctrl, NULL, "6DoF Fusion");
++	u_var_add_bool(ctrl, &ctrl->use_fusion, "Use IMU + optical fusion");
++	u_var_add_i32(ctrl, &ctrl->imu_time_offset_us, "IMU time offset (us)");
++	u_var_add_ro_u64(ctrl, &st->poses_accepted, "Optical poses accepted");
++	u_var_add_ro_u64(ctrl, &st->poses_rejected, "Optical poses rejected");
++	u_var_add_ro_u64(ctrl, &st->resets, "Filter resets");
++	u_var_add_ro_u64(ctrl, &st->poses_ignored, "Optical poses ignored (too old)");
++	u_var_add_ro_f32(ctrl, &st->last_chi2, "Last innovation chi2");
++	u_var_add_ro_f32(ctrl, &st->last_pos_innovation, "Last position innovation (m)");
++	u_var_add_ro_f32(ctrl, &st->last_fix_delay, "Last fix delay (s)");
++	u_var_add_ro_vec3_f32(ctrl, &st->gyro_bias, "Gyro bias (rad/s)");
++	u_var_add_ro_vec3_f32(ctrl, &st->accel_bias, "Accel bias (m/s2)");
++	u_var_add_f32(ctrl, &p->optical_pos_sigma, "Optical position sigma (m)");
++	u_var_add_f32(ctrl, &p->optical_rot_sigma, "Optical rotation sigma (rad)");
++	u_var_add_f32(ctrl, &p->accel_noise, "Accel noise");
++	u_var_add_f32(ctrl, &p->gyro_noise, "Gyro noise");
++	u_var_add_f32(ctrl, &p->gate_chi2, "Gate chi2");
++	u_var_add_f32(ctrl, &p->coast_start, "Coast start (s)");
++	u_var_add_f32(ctrl, &p->coast_vel_tau, "Coast velocity decay tau (s)");
++	u_var_add_f32(ctrl, &p->coast_max, "Coast max / hold after (s)");
++	u_var_add_f32(ctrl, &p->prediction_max, "Max prediction (s)");
++	u_var_add_bool(ctrl, &p->predict_with_accel, "Predict with acceleration");
++}
++
+ static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
+     .get_led_model = rift_s_controller_get_led_model,
+     .notify_frame_received = NULL,
+@@ -904,6 +1056,8 @@ rift_s_controller_create(struct rift_s_system *sys, enum xrt_device_type device_
+ 	DEBUG_TOUCH_INPUT_VEC2(ctrl, THUMBSTICK, "Thumbstick X", "Thumbstick Y");
+ 	DEBUG_TOUCH_INPUT_BOOL(ctrl, THUMBREST_TOUCH, "Thumbrest touch");
+ 
++	rift_s_controller_setup_fusion(ctrl);
++
+ 	struct rift_s_tracker *tracker = rift_s_system_get_tracker(sys);
+ 	ctrl->update_yaw_from_optical = true;
+ 	ctrl->tracking_connection = rift_s_tracker_add_controller(tracker, &ctrl->base, &tracking_callbacks);
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.h b/src/xrt/drivers/rift_s/rift_s_controller.h
+index c075704..61c3126 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller.h
+@@ -22,6 +22,11 @@
+ #include "xrt/xrt_device.h"
+ 
+ #include "rift_s.h"
++#include "rift_s_controller_fusion.h"
++
++#include <stdio.h>
++
++struct m_clock_windowed_skew_tracker;
+ 
+ #define MAX_LOG_SIZE 1024
+ //! Number of optical position samples kept for linear velocity estimation
+@@ -67,6 +72,22 @@ struct rift_s_controller
+ 	} pos_history[RIFT_S_CONTROLLER_POS_HISTORY];
+ 	//! Total number of samples pushed into @ref pos_history (write index = count % size)
+ 	uint32_t pos_history_count;
++
++	/* IMU + optical 6DoF fusion */
++	//! Whether the fusion filter drives the reported pose (RIFT_S_CTRL_FUSION)
++	bool use_fusion;
++	struct rift_s_ctrl_fusion *ctrl_fusion;
++	//! Copy of the fusion statistics for the debug UI
++	struct rift_s_ctrl_fusion_stats fusion_stats;
++	//! Controller IMU clock -> monotonic clock estimator
++	struct m_clock_windowed_skew_tracker *imu_clock;
++	//! Last IMU sample time in the monotonic clock
++	timepoint_ns last_imu_mono_ns;
++	//! Manual IMU -> camera time alignment, added to IMU timestamps (µs, debug UI)
++	int32_t imu_time_offset_us;
++	//! Optional CSV recording of IMU samples and optical poses (RIFT_S_CTRL_RECORD)
++	FILE *record_imu;
++	FILE *record_optical;
+ 	//! debug boolean - enable yaw updates
+ 	bool update_yaw_from_optical;
+ 
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+index 40b9726..b48cf3e 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+@@ -291,6 +291,16 @@ public:
+ 		return true;
+ 	}
+ 
++	void
++	reset()
++	{
++		initialised_ = false;
++		consecutive_rejects_ = 0;
++		last_fix_ts_ = 0;
++		imu_buf_.clear();
++		history_.clear();
++	}
++
+ 	bool
+ 	initialised() const
+ 	{
+@@ -612,6 +622,12 @@ rift_s_ctrl_fusion_destroy(struct rift_s_ctrl_fusion **fusion_ptr)
+ 	*fusion_ptr = nullptr;
+ }
+ 
++extern "C" void
++rift_s_ctrl_fusion_reset(struct rift_s_ctrl_fusion *fusion)
++{
++	fusion->impl->reset();
++}
++
+ extern "C" struct rift_s_ctrl_fusion_params *
+ rift_s_ctrl_fusion_params_ptr(struct rift_s_ctrl_fusion *fusion)
+ {
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+index ee4a978..366d1f0 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+@@ -111,6 +111,10 @@ rift_s_ctrl_fusion_create(const struct rift_s_ctrl_fusion_params *params);
+ void
+ rift_s_ctrl_fusion_destroy(struct rift_s_ctrl_fusion **fusion_ptr);
+ 
++//! Forget all state and buffered samples, e.g. after a controller clock discontinuity.
++void
++rift_s_ctrl_fusion_reset(struct rift_s_ctrl_fusion *fusion);
++
+ //! Pointer to the live parameters, e.g. for the debug UI. Changes apply to subsequent updates.
+ struct rift_s_ctrl_fusion_params *
+ rift_s_ctrl_fusion_params_ptr(struct rift_s_ctrl_fusion *fusion);
+-- 
+2.54.0
+

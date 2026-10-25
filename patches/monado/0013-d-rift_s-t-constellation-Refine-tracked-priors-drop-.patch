@@ -1,0 +1,489 @@
+From 63f907541d8037309395f675f83d488581cc7a79 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 22:26:45 +0200
+Subject: [PATCH] d/rift_s, t/constellation: Refine tracked priors, drop stale
+ fixes, gyro-checked resets
+
+Measured with the tracking protocol (ctrl-protocol.py / ctrl-analyze.py),
+WayVR only, no CPU load: no dropped camera frames, yet 25-30 dropouts per
+minute and 12-18 % wrong matches during slow smooth motion, and the left
+controller's filter reset itself 84 times in 5 minutes, mostly onto fixes
+30-180 degrees off the gyro orientation.
+
+Constellation tracker:
+- The fast path only accepted the prior pose as is: projected LEDs had
+  to land within the LED's own radius (~1.7 px at 40 cm), but a tracked
+  prior is typically 5 mm off (2-3 px). It failed for half the frames in
+  smooth motion and ~90 % in fast motion, leaving the broad searches,
+  which produce the wrong matches. New path for tracked priors: pair
+  blobs with the projected LEDs as mutual nearest neighbours within 6 px,
+  RANSAC-PnP from the prior, accept only if it still agrees with the
+  prior (T_CONSTELLATION_POSE_FROM_PRIOR_REFINED).
+- When the RANSAC refinement in submit_device_pose() failed, the
+  unrefined prior or last seen pose was submitted as an observation:
+  the device's own prediction, or an old pose (~10 % of fixes, identical
+  consecutive positions). Drop those instead.
+- CONSTELLATION_PRIOR_REFINE=0 restores the old behaviour for A/B tests.
+
+Rift S controller:
+- The tracker prior fallback (filter not tracking: 3DoF orientation plus
+  last optical position) no longer claims POSITION_TRACKED, so the tracker
+  only refines priors the filter actually tracks.
+- Fusion: while the orientation is trusted (accepted fix within
+  reset_trust_time = 2 s), consistency and forced resets only go to fixes
+  within reset_rot_max = 20 degrees of the filter. Wrong LED matches are
+  often consistent with each other (a flipped ring) but far off the gyro.
+  After the trust time the old rules apply, so a wrong state can't lock
+  in. Replayed on the recording: resets e.g. 11 -> 1 (hands close) and
+  22 -> 10 (watch gesture); with 1 s trust a wrong pose came back (tilt
+  error at rest p90 37 deg), with 2 s it stays correct.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_controller.c    |  10 +-
+ .../rift_s/rift_s_controller_fusion.cpp       |  18 +-
+ .../drivers/rift_s/rift_s_controller_fusion.h |   6 +
+ .../tracking/t_constellation_tracking.h       |   2 +
+ .../tracking/constellation/internal/sample.h  |   2 +
+ .../constellation/t_constellation_tracking.c  | 170 +++++++++++++++++-
+ tests/tests_rift_s_controller_fusion.cpp      |  63 +++++++
+ 7 files changed, 265 insertions(+), 6 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index b8ec166..a4412a0 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -749,8 +749,12 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
+ 		if (ctrl->last_tracked_pose_ts != 0) {
+ 			rel->pose.position = ctrl->last_tracked_pose.position;
+ 			rel->linear_velocity = rift_s_controller_estimate_linear_velocity(ctrl, os_monotonic_get_ns());
+-			rel->relation_flags |= (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
+-			                                                       XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
++			rel->relation_flags |= XRT_SPACE_RELATION_POSITION_VALID_BIT;
++			// For the constellation tracker this held position is only a search hint: not tracked,
++			// so it doesn't use it for the tight prior refinement
++			if (name != XRT_INPUT_GENERIC_TRACKER_POSE) {
++				rel->relation_flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
++			}
+ 		}
+ 	}
+ 	os_mutex_unlock(&ctrl->mutex);
+@@ -1050,6 +1054,8 @@ rift_s_controller_setup_fusion(struct rift_s_controller *ctrl)
+ 	u_var_add_f32(ctrl, &p->accel_noise, "Accel noise");
+ 	u_var_add_f32(ctrl, &p->gyro_noise, "Gyro noise");
+ 	u_var_add_f32(ctrl, &p->gate_chi2, "Gate chi2");
++	u_var_add_f32(ctrl, &p->reset_rot_max, "Reset max rotation off the filter (rad)");
++	u_var_add_f32(ctrl, &p->reset_trust_time, "Orientation trusted after a fix (s)");
+ 	u_var_add_f32(ctrl, &p->coast_start, "Coast start (s)");
+ 	u_var_add_f32(ctrl, &p->coast_vel_tau, "Coast velocity decay tau (s)");
+ 	u_var_add_f32(ctrl, &p->coast_max, "Coast max / hold after (s)");
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+index a0d9af0..58dea7f 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+@@ -422,11 +422,25 @@ private:
+ 		if (rejected_.size() < need) {
+ 			return nullptr;
+ 		}
++		// The gyro keeps the orientation good for seconds: while it is trusted, a fix far off it is a
++		// wrong LED match, however consistent
++		const bool trusted = ns_to_s(now_ts - last_fix_ts_) < params_.reset_trust_time;
++		auto rot_ok = [&](const RejectedFix &r) {
++			return !trusted || so3_log(r.dq).norm() <= params_.reset_rot_max;
++		};
+ 		if (ns_to_s(now_ts - last_fix_ts_) >= params_.reset_force_after) {
+-			return &rejected_.back();
++			for (auto it = rejected_.rbegin(); it != rejected_.rend(); ++it) {
++				if (rot_ok(*it)) {
++					return &*it;
++				}
++			}
++			return nullptr;
+ 		}
+ 		// Newest-first, find a fix whose offset is shared by enough others
+ 		for (auto it = rejected_.rbegin(); it != rejected_.rend(); ++it) {
++			if (!rot_ok(*it)) {
++				continue;
++			}
+ 			size_t agree = 0;
+ 			for (const RejectedFix &r : rejected_) {
+ 				if ((r.dp - it->dp).norm() <= params_.reset_consistency_pos &&
+@@ -710,6 +724,8 @@ rift_s_ctrl_fusion_default_params(struct rift_s_ctrl_fusion_params *out)
+ 	out->reset_consistency_pos = 0.03f;
+ 	out->reset_consistency_rot = 0.15f;
+ 	out->reset_force_after = 1.5f;
++	out->reset_rot_max = 0.35f;
++	out->reset_trust_time = 2.0f;
+ 	out->tilt_check_max = 0.26f;
+ 
+ 	out->coast_start = 0.2f;
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+index 7118add..bd4a592 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+@@ -58,6 +58,12 @@ struct rift_s_ctrl_fusion_params
+ 	float reset_consistency_rot;
+ 	//! Reset regardless of consistency once no fix was accepted for this long (s)
+ 	float reset_force_after;
++	//! While the filter's orientation is trusted, only reset onto fixes within this rotation of it (rad).
++	//! Wrong LED matches are often consistent with each other (e.g. a flipped ring) but far off the gyro.
++	float reset_rot_max;
++	//! The orientation is trusted for this long after the last accepted fix (s); after that the
++	//! consistency / forced resets above apply regardless of rotation, so a wrong state can't lock in
++	float reset_trust_time;
+ 	//! Max tilt difference between an optical pose and the accelerometer for (re)initialisation (rad)
+ 	float tilt_check_max;
+ 
+diff --git a/src/xrt/include/tracking/t_constellation_tracking.h b/src/xrt/include/tracking/t_constellation_tracking.h
+index bc6aeed..fb1b5b6 100644
+--- a/src/xrt/include/tracking/t_constellation_tracking.h
++++ b/src/xrt/include/tracking/t_constellation_tracking.h
+@@ -78,6 +78,8 @@ enum t_constellation_pose_source
+ 	T_CONSTELLATION_POSE_FROM_LABELLED_BLOBS = 2,
+ 	T_CONSTELLATION_POSE_FROM_SHALLOW_SEARCH = 3,
+ 	T_CONSTELLATION_POSE_FROM_DEEP_SEARCH = 4,
++	//! Blobs paired with LEDs projected from a tracked prior, then refined
++	T_CONSTELLATION_POSE_FROM_PRIOR_REFINED = 5,
+ };
+ 
+ //! Details about an observed pose, for recording and diagnostics
+diff --git a/src/xrt/tracking/constellation/internal/sample.h b/src/xrt/tracking/constellation/internal/sample.h
+index 9e2204e..7c0c6b0 100644
+--- a/src/xrt/tracking/constellation/internal/sample.h
++++ b/src/xrt/tracking/constellation/internal/sample.h
+@@ -37,6 +37,8 @@ struct tracking_sample_device_state
+ 	struct xrt_vec3 prior_pos_error;
+ 	struct xrt_vec3 prior_rot_error;
+ 	float gravity_error_rad; /* Gravity vector uncertainty in radians 0..M_PI */
++	/* The prior is a tracked pose (position tracked by the device's fusion), not a held guess */
++	bool prior_tracked;
+ 
+ 	/* Last observed pose, in world space */
+ 	bool have_last_seen_pose;
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracking.c b/src/xrt/tracking/constellation/t_constellation_tracking.c
+index 841e673..eb9df4c 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracking.c
++++ b/src/xrt/tracking/constellation/t_constellation_tracking.c
+@@ -29,6 +29,8 @@
+ #include "internal/sample.h"
+ 
+ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
++//! Refine tracked priors and drop unrefined prior / last seen poses (0 = the original behaviour, for A/B tests)
++DEBUG_GET_ONCE_BOOL_OPTION(ct_prior_refine, "CONSTELLATION_PRIOR_REFINE", true)
+ 
+ #define MIN_ROT_ERROR DEG_TO_RAD(30)
+ #define MIN_POS_ERROR 0.10
+@@ -39,6 +41,13 @@ DEBUG_GET_ONCE_LOG_OPTION(ct_log, "CONSTELLATION_LOG", U_LOGGING_INFO)
+ #define CT_WARN(c, ...) U_LOG_IFL_W(c->log_level, __VA_ARGS__)
+ #define CT_ERROR(c, ...) U_LOG_IFL_E(c->log_level, __VA_ARGS__)
+ 
++/* Pairing radius (px) between LEDs projected from a tracked prior and blobs. A tracked prior is
++ * typically 5 mm off (2-3 px at 40 cm), more than the LED's own projected radius that the plain
++ * prior check allows. */
++#define PRIOR_REFINE_RADIUS_PX 6.0
++/* Minimum LED <-> blob pairs for the prior refinement */
++#define PRIOR_REFINE_MIN_PAIRS 4
++
+ /* Maximum number of frames to permit waiting in the fast-processing queue */
+ #define MAX_FAST_QUEUE_SIZE 2
+ 
+@@ -179,6 +188,9 @@ struct t_constellation_tracker
+ 	struct xrt_device_masks_sample controller_masks_sample;
+ 	struct xrt_device_masks_sink *controller_masks_sink;
+ 
++	//! CONSTELLATION_PRIOR_REFINE
++	bool prior_refine;
++
+ 	//! Counters for t_constellation_tracker_get_stats, protected by stats_lock
+ 	struct os_mutex stats_lock;
+ 	struct t_constellation_tracker_stats stats;
+@@ -331,7 +343,8 @@ mark_matching_blobs(struct t_constellation_tracker *ct,
+ 	}
+ }
+ 
+-static void
++//! @return false if the pose was dropped (unrefined prior / last seen pose)
++static bool
+ submit_device_pose(struct t_constellation_tracker *ct,
+                    struct tracking_sample_device_state *dev_state,
+                    struct constellation_tracking_sample *sample,
+@@ -358,6 +371,13 @@ submit_device_pose(struct t_constellation_tracker *ct,
+ 	                     &cam->camera_model, &num_leds_out, &num_inliers)) {
+ 		CT_DEBUG(ct, "Camera %d RANSAC-PnP refinement for device %d from %u blobs failed", view_id,
+ 		         device->led_model.id, view->bwobs->num_blobs);
++		/* An unrefined prior or last seen pose is not a measurement: the prior is the device's own
++		 * prediction, and the last seen pose is old. Submitting them fed the fusion stale or self-made
++		 * fixes. Search results are already fitted to the blobs. */
++		if (ct->prior_refine &&
++		    (source == T_CONSTELLATION_POSE_FROM_PRIOR || source == T_CONSTELLATION_POSE_FROM_LAST_SEEN)) {
++			return false;
++		}
+ 	} else {
+ 		CT_DEBUG(ct,
+ 		         "Camera %d RANSAC-PnP refinement for device %d from %u blobs had %d LEDs with %d inliers. "
+@@ -523,6 +543,7 @@ submit_device_pose(struct t_constellation_tracker *ct,
+ 		}
+ 	}
+ 	os_mutex_unlock(&ct->tracked_device_lock);
++	return true;
+ }
+ 
+ /* Fast matching test based on hypothesised pose */
+@@ -557,14 +578,150 @@ device_try_global_pose(struct t_constellation_tracker *ct,
+ 		                                      &cam->camera_model, NULL);
+ 
+ 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
+-			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj_candidate, source);
+-			ret = true;
++			if (submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj_candidate, source)) {
++				ret = true;
++			}
+ 		}
+ 	}
+ 
+ 	return ret;
+ }
+ 
++/*!
++ * Pair blobs with the LEDs projected from a tracked prior (mutual nearest neighbours within
++ * PRIOR_REFINE_RADIUS_PX), refine the pose with RANSAC-PnP from the prior, and accept it only if it
++ * still agrees with the prior. Works on a copy of the blobs, the real labels are only updated by
++ * submit_device_pose() for an accepted pose. Views with the most pairs are tried first.
++ */
++static bool
++device_try_prior_refine(struct t_constellation_tracker *ct,
++                        struct tracking_sample_device_state *dev_state,
++                        struct constellation_tracking_sample *sample)
++{
++	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
++	struct t_constellation_led_model *leds_model = &device->led_model;
++	const double r2 = PRIOR_REFINE_RADIUS_PX * PRIOR_REFINE_RADIUS_PX;
++
++	int pairs_per_view[CONSTELLATION_MAX_CAMERAS] = {0};
++	struct pose_metrics_blob_match_info match_info[CONSTELLATION_MAX_CAMERAS];
++	int led_blob[CONSTELLATION_MAX_CAMERAS][MAX_OBJECT_LEDS];
++
++	for (int view_id = 0; view_id < sample->n_views; view_id++) {
++		struct tracking_sample_frame *view = sample->views + view_id;
++		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
++		if (view->bwobs == NULL || view->bwobs->num_blobs == 0) {
++			continue;
++		}
++		blobservation *bwobs = view->bwobs;
++
++		struct xrt_pose P_cam_obj_prior;
++		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
++
++		struct pose_metrics_blob_match_info *mi = &match_info[view_id];
++		pose_metrics_match_pose_to_blobs(&P_cam_obj_prior, bwobs->blobs, bwobs->num_blobs, leds_model,
++		                                 &cam->camera_model, mi);
++		if (mi->num_visible_leds < PRIOR_REFINE_MIN_PAIRS) {
++			continue;
++		}
++
++		// Nearest blob for each visible LED, and nearest visible LED for each blob
++		int blob_led[MAX_BLOBS_PER_FRAME];
++		double blob_d2[MAX_BLOBS_PER_FRAME];
++		for (int b = 0; b < bwobs->num_blobs; b++) {
++			blob_led[b] = -1;
++			blob_d2[b] = r2;
++		}
++		for (int l = 0; l < mi->num_visible_leds; l++) {
++			led_blob[view_id][l] = -1;
++			double best = r2;
++			for (int b = 0; b < bwobs->num_blobs; b++) {
++				struct blob *blob = bwobs->blobs + b;
++				uint32_t obj = LED_OBJECT_ID(blob->led_id);
++				if (obj != LED_INVALID_ID && obj != leds_model->id) {
++					continue; // belongs to another device, or noise
++				}
++				double dx = blob->x - mi->visible_leds[l].pos_px.x;
++				double dy = blob->y - mi->visible_leds[l].pos_px.y;
++				double d2 = dx * dx + dy * dy;
++				if (d2 < best) {
++					best = d2;
++					led_blob[view_id][l] = b;
++				}
++				if (d2 < blob_d2[b]) {
++					blob_d2[b] = d2;
++					blob_led[b] = l;
++				}
++			}
++		}
++		for (int l = 0; l < mi->num_visible_leds; l++) {
++			int b = led_blob[view_id][l];
++			if (b >= 0 && blob_led[b] == l) {
++				pairs_per_view[view_id]++;
++			} else {
++				led_blob[view_id][l] = -1;
++			}
++		}
++	}
++
++	for (int attempt = 0; attempt < sample->n_views; attempt++) {
++		int view_id = -1;
++		for (int v = 0; v < sample->n_views; v++) {
++			if (pairs_per_view[v] >= PRIOR_REFINE_MIN_PAIRS &&
++			    (view_id < 0 || pairs_per_view[v] > pairs_per_view[view_id])) {
++				view_id = v;
++			}
++		}
++		if (view_id < 0) {
++			return false;
++		}
++		int pairs = pairs_per_view[view_id];
++		pairs_per_view[view_id] = 0; // don't retry this view
++
++		struct tracking_sample_frame *view = sample->views + view_id;
++		struct constellation_tracker_camera_state *cam = ct->cam + view_id;
++		blobservation *bwobs = view->bwobs;
++		struct pose_metrics_blob_match_info *mi = &match_info[view_id];
++
++		// Blob copy labelled with the pairs only, for RANSAC-PnP
++		struct blob blobs[MAX_BLOBS_PER_FRAME];
++		memcpy(blobs, bwobs->blobs, sizeof(struct blob) * bwobs->num_blobs);
++		for (int b = 0; b < bwobs->num_blobs; b++) {
++			blobs[b].led_id = LED_INVALID_ID;
++		}
++		for (int l = 0; l < mi->num_visible_leds; l++) {
++			int b = led_blob[view_id][l];
++			if (b >= 0) {
++				blobs[b].led_id = LED_MAKE_ID(leds_model->id, mi->visible_leds[l].led->id);
++			}
++		}
++
++		struct xrt_pose P_cam_obj_prior;
++		math_pose_transform(&view->P_cam_world, &dev_state->P_world_obj_prior, &P_cam_obj_prior);
++		struct xrt_pose P_cam_obj = P_cam_obj_prior;
++		int num_inliers = 0;
++		if (!ransac_pnp_pose(&P_cam_obj, blobs, bwobs->num_blobs, leds_model, &cam->camera_model, NULL,
++		                     &num_inliers) ||
++		    num_inliers < PRIOR_REFINE_MIN_PAIRS) {
++			CT_DEBUG(ct, "Camera %d prior refinement for device %d: PnP failed (%d pairs, %d inliers)",
++			         view_id, leds_model->id, pairs, num_inliers);
++			continue;
++		}
++
++		pose_metrics_evaluate_pose_with_prior(&dev_state->score, &P_cam_obj, true, &P_cam_obj_prior,
++		                                      &dev_state->prior_pos_error, &dev_state->prior_rot_error,
++		                                      bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model,
++		                                      NULL);
++		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
++			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
++			                   T_CONSTELLATION_POSE_FROM_PRIOR_REFINED);
++			return true;
++		}
++		CT_DEBUG(ct, "Camera %d prior refinement for device %d: %d pairs, %d inliers, match flags 0x%x",
++		         view_id, leds_model->id, pairs, num_inliers, dev_state->score.match_flags);
++	}
++	return false;
++}
++
+ /* Try and recover the pose from labelled blobs */
+ static bool
+ device_try_recover_pose(struct t_constellation_tracker *ct,
+@@ -768,6 +925,7 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
+ 		// Apply device -> LED model pose from xsr = P_world_device + P_device_model = P_world_model
+ 		struct xrt_pose P_xrworld_model;
+ 		math_pose_transform(&xsr.pose, &device->led_model.P_device_model, &P_xrworld_model);
++		dev_state->prior_tracked = (xsr.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
+ 
+ 		// Incoming controller pose is in OpenXR. Flip it to OpenCV for all our operations
+ 		pose_flip_YZ(&P_xrworld_model, &dev_state->P_world_obj_prior);
+@@ -809,6 +967,11 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
+ 			         device->led_model.id, dev_state->found_pose_view_id);
+ 			continue;
+ 		}
++		if (ct->prior_refine && dev_state->prior_tracked && device_try_prior_refine(ct, dev_state, sample)) {
++			CT_DEBUG(ct, "Found fast match for device %d in view %d by refining the prior",
++			         device->led_model.id, dev_state->found_pose_view_id);
++			continue;
++		}
+ 		if (dev_state->have_last_seen_pose &&
+ 		    device_try_global_pose(ct, dev_state, sample, &dev_state->last_seen_pose,
+ 		                           T_CONSTELLATION_POSE_FROM_LAST_SEEN)) {
+@@ -1130,6 +1293,7 @@ t_constellation_tracker_create(struct xrt_frame_context *xfctx,
+ 	os_mutex_init(&ct->stats_lock);
+ 
+ 	ct->log_level = debug_get_log_option_ct_log();
++	ct->prior_refine = debug_get_bool_option_ct_prior_refine();
+ 	ct->debug_draw_blob_tint = true;
+ 	ct->debug_draw_blob_ids = true;
+ 	ct->hmd_xdev = hmd_xdev;
+diff --git a/tests/tests_rift_s_controller_fusion.cpp b/tests/tests_rift_s_controller_fusion.cpp
+index 575c17f..f4409ba 100644
+--- a/tests/tests_rift_s_controller_fusion.cpp
++++ b/tests/tests_rift_s_controller_fusion.cpp
+@@ -429,6 +429,69 @@ TEST_CASE("rift_s_ctrl_fusion: repeated far fixes reset the filter")
+ 	CHECK(stats.resets >= 2);
+ }
+ 
++namespace {
++
++//! Feed consistent fixes rotated by @p flip_rad (a "flipped ring" wrong match) every fix period until a reset or
++//! @p duration_ns, return the first non-rejected result and when it happened.
++rift_s_ctrl_fusion_pose_result
++feed_flipped_fixes(Sim &sim, int64_t &t, int64_t duration_ns, double flip_rad, int64_t &out_reset_t)
++{
++	const int64_t end = t + duration_ns;
++	const Quaterniond flip(Eigen::AngleAxisd(flip_rad, Vector3d::UnitZ()));
++	rift_s_ctrl_fusion_pose_result last = RIFT_S_CTRL_FUSION_POSE_REJECTED;
++	while (t < end) {
++		xrt_pose p = sim.optical_pose(t);
++		Quaterniond q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
++		q = q * flip;
++		p.orientation = {(float)q.x(), (float)q.y(), (float)q.z(), (float)q.w()};
++		p.position.y += 0.2f; // wrong matches have a wrong position too
++		last = rift_s_ctrl_fusion_pose(sim.fusion, t, &p);
++		if (last != RIFT_S_CTRL_FUSION_POSE_REJECTED) {
++			out_reset_t = t;
++			return last;
++		}
++		for (int k = 0; k < kFixPeriod / kImuPeriod; k++) {
++			t += kImuPeriod;
++			sim.feed_imu(t);
++		}
++	}
++	return last;
++}
++
++} // namespace
++
++TEST_CASE("rift_s_ctrl_fusion: consistent flipped fixes don't reset while the gyro is trusted")
++{
++	Sim sim;
++	for (int64_t t = kImuPeriod; t < 3000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++	}
++	int64_t t = 3000 * kMs;
++	const int64_t lost_from = t;
++	int64_t reset_t = 0;
++	rift_s_ctrl_fusion_pose_result res = feed_flipped_fixes(sim, t, 5000 * kMs, M_PI * 0.75, reset_t);
++
++	rift_s_ctrl_fusion_params params;
++	rift_s_ctrl_fusion_default_params(&params);
++	// Rejected throughout the trust time, then the escape hatch resets onto them
++	REQUIRE(res == RIFT_S_CTRL_FUSION_POSE_RESET);
++	CHECK(s_of(reset_t - lost_from) >= params.reset_trust_time - 0.05);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: consistent fixes close to the gyro still reset quickly")
++{
++	Sim sim;
++	for (int64_t t = kImuPeriod; t < 3000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++	}
++	int64_t t = 3000 * kMs;
++	const int64_t lost_from = t;
++	int64_t reset_t = 0;
++	rift_s_ctrl_fusion_pose_result res = feed_flipped_fixes(sim, t, 5000 * kMs, 0.1, reset_t);
++	REQUIRE(res == RIFT_S_CTRL_FUSION_POSE_RESET);
++	CHECK(s_of(reset_t - lost_from) < 0.5);
++}
++
+ TEST_CASE("rift_s_ctrl_fusion: fixes older than the history are ignored")
+ {
+ 	Sim sim;
+-- 
+2.54.0
+

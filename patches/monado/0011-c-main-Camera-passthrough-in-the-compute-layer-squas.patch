@@ -1,0 +1,1207 @@
+From 804d982cd2bb3714d4c85b4764ea61e4df1f0711 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:36:56 +0200
+Subject: [PATCH 11/11] c/main: Camera passthrough in the compute layer
+ squasher
+
+Draw the device's passthrough camera images (get_passthrough_frames)
+as a pseudo layer in layer.comp: every view ray hits a sphere around
+the eye (XRT_PASSTHROUGH_DISTANCE_M, default 2 m), that point is moved
+into the camera with the head pose at capture time and projected with
+the camera's Fisheye62 model. Head motion between capture and display
+is compensated, the room stays put while the head moves.
+
+- Behind all layers when the frame uses the alpha blend environment
+  mode (WayVR with "Enable passthrough").
+- Over the main app's layers but under overlay sessions when the
+  device's forced flag is set, faded in and out
+  (XRT_PASSTHROUGH_FADE_S). The multi compositor now tells the native
+  compositor how many layers at the end come from overlay sessions
+  (xrt_layer_frame_data::overlay_layer_count), so WayVR stays usable
+  on top of the room.
+
+The images are uploaded through persistently mapped staging buffers
+recorded into the frame's command buffer, only when a new image
+arrived. The one projection layer fast path is skipped while
+passthrough is shown. Nothing is done while it is off. Compute path
+only (the desktop default). XRT_PASSTHROUGH_GAIN scales brightness,
+XRT_PASSTHROUGH_STATS=1 logs a summary once a second, the debug UI has
+"Compositor: Passthrough".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/compositor/main/CMakeLists.txt        |   2 +
+ src/xrt/compositor/main/comp_passthrough.c    | 484 ++++++++++++++++++
+ src/xrt/compositor/main/comp_passthrough.h    | 151 ++++++
+ src/xrt/compositor/main/comp_renderer.c       |  71 ++-
+ src/xrt/compositor/multi/comp_multi_system.c  |   9 +
+ src/xrt/compositor/shaders/layer.comp         |  54 ++
+ .../compositor/shaders/layer_defines.inc.glsl |   1 +
+ src/xrt/compositor/util/comp_render.h         |  48 +-
+ src/xrt/compositor/util/comp_render_cs.c      | 120 ++++-
+ src/xrt/include/xrt/xrt_compositor.h          |   6 +
+ 10 files changed, 925 insertions(+), 21 deletions(-)
+ create mode 100644 src/xrt/compositor/main/comp_passthrough.c
+ create mode 100644 src/xrt/compositor/main/comp_passthrough.h
+
+diff --git a/src/xrt/compositor/main/CMakeLists.txt b/src/xrt/compositor/main/CMakeLists.txt
+index 06575b4..2ce5d95 100644
+--- a/src/xrt/compositor/main/CMakeLists.txt
++++ b/src/xrt/compositor/main/CMakeLists.txt
+@@ -23,6 +23,8 @@ add_library(
+ 	comp_window_debug_image.c
+ 	comp_mirror_to_debug_gui.c
+ 	comp_mirror_to_debug_gui.h
++	comp_passthrough.c
++	comp_passthrough.h
+ 	)
+ target_link_libraries(
+ 	comp_main
+diff --git a/src/xrt/compositor/main/comp_passthrough.c b/src/xrt/compositor/main/comp_passthrough.c
+new file mode 100644
+index 0000000..e4dabdf
+--- /dev/null
++++ b/src/xrt/compositor/main/comp_passthrough.c
+@@ -0,0 +1,484 @@
++// Copyright 2026, Kunstbanause.
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Camera passthrough for the main compositor.
++ * @ingroup comp_main
++ */
++
++#include "xrt/xrt_frame.h"
++
++#include "math/m_api.h"
++
++#include "util/u_debug.h"
++#include "util/u_logging.h"
++#include "util/u_misc.h"
++#include "util/u_time.h"
++#include "util/u_var.h"
++
++#include "vk/vk_mini_helpers.h"
++
++#include "main/comp_passthrough.h"
++
++#include <math.h>
++#include <string.h>
++
++
++//! Distance of the sphere the camera images are projected on
++DEBUG_GET_ONCE_FLOAT_OPTION(passthrough_distance, "XRT_PASSTHROUGH_DISTANCE_M", 2.0f)
++//! Brightness multiplier for the camera images
++DEBUG_GET_ONCE_FLOAT_OPTION(passthrough_gain, "XRT_PASSTHROUGH_GAIN", 1.0f)
++//! Fade time when the forced passthrough is toggled
++DEBUG_GET_ONCE_FLOAT_OPTION(passthrough_fade, "XRT_PASSTHROUGH_FADE_S", 0.15f)
++//! Log a summary once a second, for debugging
++DEBUG_GET_ONCE_BOOL_OPTION(passthrough_stats, "XRT_PASSTHROUGH_STATS", false)
++
++
++/*
++ *
++ * Helpers.
++ *
++ */
++
++static void
++release_frames(struct xrt_passthrough_frames *frames)
++{
++	for (uint32_t i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++		xrt_frame_reference(&frames->cameras[i].frame, NULL);
++	}
++	frames->camera_count = 0;
++}
++
++static void
++camera_fini(struct vk_bundle *vk, struct comp_passthrough_camera *cam)
++{
++	D(ImageView, cam->view);
++	D(Image, cam->image);
++	DF(Memory, cam->memory);
++	render_buffer_fini(vk, &cam->staging);
++	U_ZERO(cam);
++}
++
++static bool
++camera_init(struct vk_bundle *vk, struct comp_passthrough_camera *cam, uint32_t width, uint32_t height)
++{
++	VkResult ret;
++	VkExtent2D extent = {width, height};
++	VkFormat format = VK_FORMAT_R8_UNORM;
++
++	ret = vk_create_image_simple(                                     //
++	    vk,                                                           // vk_bundle
++	    extent,                                                       // extent
++	    format,                                                       // format
++	    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, // usage
++	    &cam->memory,                                                 // out_mem
++	    &cam->image);                                                 // out_image
++	if (ret != VK_SUCCESS) {
++		U_LOG_E("Passthrough: vk_create_image_simple: %s", vk_result_string(ret));
++		return false;
++	}
++
++	VkImageSubresourceRange subresource_range = {
++	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++	    .baseMipLevel = 0,
++	    .levelCount = 1,
++	    .baseArrayLayer = 0,
++	    .layerCount = 1,
++	};
++
++	ret = vk_create_view(      //
++	    vk,                    // vk_bundle
++	    cam->image,            // image
++	    VK_IMAGE_VIEW_TYPE_2D, // type
++	    format,                // format
++	    subresource_range,     // subresource_range
++	    &cam->view);           // out_view
++	if (ret != VK_SUCCESS) {
++		U_LOG_E("Passthrough: vk_create_view: %s", vk_result_string(ret));
++		return false;
++	}
++
++	ret = render_buffer_init(                                                      //
++	    vk,                                                                        // vk_bundle
++	    &cam->staging,                                                             // buffer
++	    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,                                          // usage_flags
++	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, // memory_property_flags
++	    (VkDeviceSize)width * height);                                             // size
++	if (ret != VK_SUCCESS) {
++		U_LOG_E("Passthrough: render_buffer_init: %s", vk_result_string(ret));
++		return false;
++	}
++
++	ret = render_buffer_map(vk, &cam->staging);
++	if (ret != VK_SUCCESS) {
++		U_LOG_E("Passthrough: render_buffer_map: %s", vk_result_string(ret));
++		return false;
++	}
++
++	cam->width = width;
++	cam->height = height;
++
++	return true;
++}
++
++//! (Re)create the camera images to fit the frames, returns false if that failed
++static bool
++ensure_cameras(struct comp_passthrough *pt, const struct xrt_passthrough_frames *frames)
++{
++	bool fits = pt->cam_count == frames->camera_count;
++	for (uint32_t i = 0; fits && i < frames->camera_count; i++) {
++		const struct xrt_frame *xf = frames->cameras[i].frame;
++		fits = pt->cams[i].width == xf->width && pt->cams[i].height == xf->height;
++	}
++	if (fits) {
++		return true;
++	}
++
++	// Only happens on first use, the GPU is idle between frames (see comp_renderer_draw).
++	for (uint32_t i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++		camera_fini(pt->vk, &pt->cams[i]);
++	}
++	pt->cam_count = 0;
++	pt->gpu_timestamp_ns = 0;
++
++	for (uint32_t i = 0; i < frames->camera_count; i++) {
++		const struct xrt_frame *xf = frames->cameras[i].frame;
++		if (!camera_init(pt->vk, &pt->cams[i], xf->width, xf->height)) {
++			for (uint32_t k = 0; k <= i; k++) {
++				camera_fini(pt->vk, &pt->cams[k]);
++			}
++			return false;
++		}
++	}
++	pt->cam_count = frames->camera_count;
++
++	U_LOG_I("Passthrough: created %u camera images (%ux%u)", pt->cam_count, pt->cams[0].width,
++	        pt->cams[0].height);
++
++	return true;
++}
++
++//! Usable for the shader: one L8 image per view
++static bool
++frames_valid(const struct xrt_passthrough_frames *frames)
++{
++	if (frames->camera_count != XRT_MAX_PASSTHROUGH_CAMERAS) {
++		return false;
++	}
++	for (uint32_t i = 0; i < frames->camera_count; i++) {
++		const struct xrt_frame *xf = frames->cameras[i].frame;
++		if (xf == NULL || xf->format != XRT_FORMAT_L8 || xf->width == 0 || xf->height == 0) {
++			return false;
++		}
++	}
++	return true;
++}
++
++
++static double
++image_brightness(const struct xrt_frame *xf)
++{
++	uint64_t sum = 0, count = 0;
++	for (uint32_t y = 0; y < xf->height; y += 8) {
++		for (uint32_t x = 0; x < xf->width; x += 8) {
++			sum += xf->data[(size_t)y * xf->stride + x];
++			count++;
++		}
++	}
++	return count ? (double)sum / (double)count : 0.0;
++}
++
++static void
++stats_flush(struct comp_passthrough *pt, int64_t now_ns)
++{
++	if (!pt->stats.enabled) {
++		return;
++	}
++	if (pt->stats.window_start_ns == 0) {
++		pt->stats.window_start_ns = now_ns;
++		pt->stats.brightness_min = 1e9;
++		return;
++	}
++	if (now_ns - pt->stats.window_start_ns < U_TIME_1S_IN_NS) {
++		return;
++	}
++	if (pt->stats.drawn > 0 || pt->stats.no_images > 0) {
++		U_LOG_W("Passthrough: frames %u drawn %u no_images %u pose_failed %u uploads %u max_age %.1f ms "
++		        "brightness %.1f..%.1f requery %.3f deg opacity %.2f bg %d",
++		        pt->stats.frames, pt->stats.drawn, pt->stats.no_images, pt->stats.pose_failed,
++		        pt->stats.uploads, pt->stats.max_age_ms, pt->stats.brightness_min, pt->stats.brightness_max,
++		        pt->stats.max_requery_deg, pt->opacity, pt->background);
++	}
++	bool enabled = pt->stats.enabled;
++	U_ZERO(&pt->stats);
++	pt->stats.enabled = enabled;
++	pt->stats.window_start_ns = now_ns;
++	pt->stats.brightness_min = 1e9;
++}
++
++/*
++ *
++ * 'Exported' functions.
++ *
++ */
++
++void
++comp_passthrough_init(struct comp_passthrough *pt, struct vk_bundle *vk)
++{
++	U_ZERO(pt);
++	pt->vk = vk;
++
++	pt->settings.radius_m = debug_get_float_option_passthrough_distance();
++	pt->settings.gain = debug_get_float_option_passthrough_gain();
++	pt->settings.fade_s = debug_get_float_option_passthrough_fade();
++	pt->stats.enabled = debug_get_bool_option_passthrough_stats();
++
++	u_var_add_root(pt, "Compositor: Passthrough", false);
++	u_var_add_bool(pt, &pt->settings.force, "Force on");
++	u_var_add_f32(pt, &pt->settings.radius_m, "Distance (m)");
++	u_var_add_f32(pt, &pt->settings.gain, "Gain");
++	u_var_add_f32(pt, &pt->settings.fade_s, "Fade (s)");
++	u_var_add_bool(pt, &pt->settings.head_locked, "Debug: head locked (no capture time pose)");
++	u_var_add_ro_f32(pt, &pt->opacity, "Opacity");
++}
++
++void
++comp_passthrough_fini(struct comp_passthrough *pt)
++{
++	u_var_remove_root(pt);
++
++	release_frames(&pt->frames);
++	for (uint32_t i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++		camera_fini(pt->vk, &pt->cams[i]);
++	}
++	pt->cam_count = 0;
++}
++
++bool
++comp_passthrough_update(struct comp_passthrough *pt,
++                        struct xrt_device *xdev,
++                        enum xrt_blend_mode blend_mode,
++                        int64_t now_ns)
++{
++	pt->enabled = false;
++
++	if (pt->unsupported || pt->failed) {
++		return false;
++	}
++
++	stats_flush(pt, now_ns);
++	pt->stats.frames++;
++
++	// Cheap poll for the forced flag first, images are only copied while we ask for them.
++	struct xrt_passthrough_frames poll = {0};
++	xrt_result_t xret = xrt_device_get_passthrough_frames(xdev, false, &poll);
++	if (xret == XRT_ERROR_NOT_IMPLEMENTED) {
++		pt->unsupported = true;
++		return false;
++	}
++	release_frames(&poll);
++	if (xret != XRT_SUCCESS) {
++		return false;
++	}
++
++	bool forced = poll.forced || pt->settings.force;
++	bool background_wanted = blend_mode == XRT_BLEND_MODE_ALPHA_BLEND;
++
++	// Fade the forced passthrough in and out.
++	float dt_s = pt->last_update_ns != 0 ? (float)time_ns_to_s(now_ns - pt->last_update_ns) : 0.0f;
++	pt->last_update_ns = now_ns;
++	dt_s = CLAMP(dt_s, 0.0f, 0.1f);
++	float step = pt->settings.fade_s > 0.0f ? dt_s / pt->settings.fade_s : 1.0f;
++	pt->opacity = forced ? MIN(pt->opacity + step, 1.0f) : MAX(pt->opacity - step, 0.0f);
++
++	if (!background_wanted && !forced && pt->opacity <= 0.0f) {
++		// Not needed, let go of the images so the device stops copying.
++		release_frames(&pt->frames);
++		pt->upload_pending = false;
++		pt->gpu_timestamp_ns = 0;
++		return false;
++	}
++
++	struct xrt_passthrough_frames latest = {0};
++	xret = xrt_device_get_passthrough_frames(xdev, true, &latest);
++	if (xret != XRT_SUCCESS || !frames_valid(&latest)) {
++		pt->stats.no_images++;
++		// No (recent) images, show nothing rather than a frozen room.
++		release_frames(&latest);
++		release_frames(&pt->frames);
++		pt->upload_pending = false;
++		pt->gpu_timestamp_ns = 0;
++		return false;
++	}
++
++	bool is_new = pt->frames.camera_count == 0 ||
++	              latest.cameras[0].timestamp_ns != pt->frames.cameras[0].timestamp_ns;
++	if (is_new) {
++		release_frames(&pt->frames);
++		pt->frames = latest; // Takes over the references.
++
++		if (!ensure_cameras(pt, &pt->frames)) {
++			U_LOG_E("Passthrough: could not create the camera images, disabling passthrough");
++			pt->failed = true;
++			release_frames(&pt->frames);
++			return false;
++		}
++		pt->upload_pending = true;
++
++		if (pt->stats.enabled) {
++			pt->stats.uploads++;
++			double b = image_brightness(pt->frames.cameras[0].frame);
++			pt->stats.brightness_min = MIN(pt->stats.brightness_min, b);
++			pt->stats.brightness_max = MAX(pt->stats.brightness_max, b);
++		}
++	} else {
++		release_frames(&latest);
++	}
++	pt->stats.max_age_ms = MAX(pt->stats.max_age_ms, (double)(now_ns - pt->frames.cameras[0].timestamp_ns) / U_TIME_1MS_IN_NS);
++
++	// Both while fading over an alpha blend app, else it would fade in from black.
++	pt->background = background_wanted;
++	pt->enabled = pt->background || pt->opacity > 0.0f;
++
++	return pt->enabled;
++}
++
++void
++comp_passthrough_record_upload(struct comp_passthrough *pt, VkCommandBuffer cmd)
++{
++	if (!pt->upload_pending) {
++		return;
++	}
++
++	struct vk_bundle *vk = pt->vk;
++
++	VkImageSubresourceRange subresource_range = {
++	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++	    .baseMipLevel = 0,
++	    .levelCount = 1,
++	    .baseArrayLayer = 0,
++	    .layerCount = 1,
++	};
++
++	VkImageSubresourceLayers subresource_layers = {
++	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++	    .mipLevel = 0,
++	    .baseArrayLayer = 0,
++	    .layerCount = 1,
++	};
++
++	for (uint32_t i = 0; i < pt->cam_count; i++) {
++		struct comp_passthrough_camera *cam = &pt->cams[i];
++		const struct xrt_frame *xf = pt->frames.cameras[i].frame;
++
++		// The previous frame's copy has finished, the renderer waits for the queue to be idle each frame.
++		uint8_t *dst = cam->staging.mapped;
++		for (uint32_t y = 0; y < cam->height; y++) {
++			memcpy(dst + (size_t)y * cam->width, xf->data + (size_t)y * xf->stride, cam->width);
++		}
++
++		// The whole image is overwritten, so the old content can be discarded.
++		vk_cmd_image_barrier_gpu_locked(          //
++		    vk,                                   //
++		    cmd,                                  //
++		    cam->image,                           //
++		    0,                                    //
++		    VK_ACCESS_TRANSFER_WRITE_BIT,         //
++		    VK_IMAGE_LAYOUT_UNDEFINED,            //
++		    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, //
++		    subresource_range);                   //
++
++		VkBufferImageCopy region = {
++		    .bufferOffset = 0,
++		    .bufferRowLength = 0,
++		    .bufferImageHeight = 0,
++		    .imageSubresource = subresource_layers,
++		    .imageOffset = {0, 0, 0},
++		    .imageExtent = {cam->width, cam->height, 1},
++		};
++
++		vk->vkCmdCopyBufferToImage(               //
++		    cmd,                                  // commandBuffer
++		    cam->staging.buffer,                  // srcBuffer
++		    cam->image,                           // dstImage
++		    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, // dstImageLayout
++		    1,                                    // regionCount
++		    &region);                             // pRegions
++
++		vk_cmd_image_barrier_gpu_locked(              //
++		    vk,                                       //
++		    cmd,                                      //
++		    cam->image,                               //
++		    VK_ACCESS_TRANSFER_WRITE_BIT,             //
++		    VK_ACCESS_SHADER_READ_BIT,                //
++		    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,     //
++		    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, //
++		    subresource_range);                       //
++	}
++
++	pt->gpu_timestamp_ns = pt->frames.cameras[0].timestamp_ns;
++	pt->upload_pending = false;
++}
++
++void
++comp_passthrough_fill_render_data(struct comp_passthrough *pt,
++                                  struct xrt_device *xdev,
++                                  int64_t display_time_ns,
++                                  uint32_t first_overlay_layer,
++                                  struct comp_render_passthrough_data *out)
++{
++	U_ZERO(out);
++
++	if (!pt->enabled || pt->gpu_timestamp_ns == 0) {
++		return;
++	}
++
++	// Head pose when the images were taken, so they stay put in the world while the head moves.
++	int64_t pose_time_ns = pt->settings.head_locked ? display_time_ns : pt->gpu_timestamp_ns;
++	struct xrt_space_relation head = XRT_SPACE_RELATION_ZERO;
++	xrt_result_t xret = xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, pose_time_ns, &head);
++	if (xret != XRT_SUCCESS || (head.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) == 0) {
++		pt->stats.pose_failed++;
++		return;
++	}
++
++	// Does the pose for the same image change from frame to frame (the tracker revising its history)?
++	if (pt->stats.enabled && pt->stats.last_pose_ts == pose_time_ns) {
++		struct xrt_quat inv, delta;
++		math_quat_invert(&pt->stats.last_pose.orientation, &inv);
++		math_quat_rotate(&inv, &head.pose.orientation, &delta);
++		double deg = 2.0 * acos(fmin(fabs((double)delta.w), 1.0)) * 180.0 / M_PI;
++		pt->stats.max_requery_deg = MAX(pt->stats.max_requery_deg, deg);
++	}
++	pt->stats.last_pose = head.pose;
++	pt->stats.last_pose_ts = pose_time_ns;
++	pt->stats.drawn++;
++
++	out->enabled = true;
++	out->background = pt->background;
++	out->opacity = pt->opacity;
++	out->first_overlay_layer = first_overlay_layer;
++	out->gain = pt->settings.gain;
++	out->radius_m = MAX(pt->settings.radius_m, 0.1f);
++
++	for (uint32_t i = 0; i < pt->cam_count && i < XRT_MAX_VIEWS; i++) {
++		const struct xrt_passthrough_camera *cam = &pt->frames.cameras[i];
++
++		out->views[i].image_view = pt->cams[i].view;
++		math_pose_transform(&head.pose, &cam->head_from_camera, &out->views[i].world_from_camera);
++
++		float *in = out->views[i].intrinsics;
++		in[0] = cam->fx;
++		in[1] = cam->fy;
++		in[2] = cam->cx;
++		in[3] = cam->cy;
++		for (int k = 0; k < 6; k++) {
++			in[4 + k] = cam->k[k];
++		}
++		in[10] = cam->p1;
++		in[11] = cam->p2;
++
++		out->views[i].width = pt->cams[i].width;
++		out->views[i].height = pt->cams[i].height;
++	}
++}
+diff --git a/src/xrt/compositor/main/comp_passthrough.h b/src/xrt/compositor/main/comp_passthrough.h
+new file mode 100644
+index 0000000..05abe44
+--- /dev/null
++++ b/src/xrt/compositor/main/comp_passthrough.h
+@@ -0,0 +1,151 @@
++// Copyright 2026, Kunstbanause.
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Camera passthrough for the main compositor.
++ * @ingroup comp_main
++ *
++ * The device hands out camera images (@ref xrt_device::get_passthrough_frames), they are uploaded into
++ * images here and drawn by the compute layer squasher as a pseudo layer: behind the app layers when the
++ * app asked for the alpha blend environment mode, and over the main app's layers (under overlay apps)
++ * when the user forced passthrough on.
++ */
++
++#pragma once
++
++#include "xrt/xrt_defines.h"
++#include "xrt/xrt_device.h"
++
++#include "vk/vk_helpers.h"
++
++#include "render/render_interface.h"
++
++#include "util/comp_render.h"
++
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*!
++ * One camera's GPU resources.
++ */
++struct comp_passthrough_camera
++{
++	VkImage image;
++	VkDeviceMemory memory;
++	VkImageView view;
++
++	//! Host visible, persistently mapped, tightly packed image data.
++	struct render_buffer staging;
++
++	uint32_t width, height;
++};
++
++/*!
++ * Camera passthrough state, owned by the renderer.
++ */
++struct comp_passthrough
++{
++	struct vk_bundle *vk;
++
++	//! The device has no passthrough, stop asking.
++	bool unsupported;
++
++	//! Creating the Vulkan resources failed, don't retry every frame.
++	bool failed;
++
++	struct comp_passthrough_camera cams[XRT_MAX_PASSTHROUGH_CAMERAS];
++
++	//! Number of created cameras in @ref cams.
++	uint32_t cam_count;
++
++	//! Latest images from the device, holds references.
++	struct xrt_passthrough_frames frames;
++
++	//! Capture time of the images in @ref cams, 0 if there are none.
++	int64_t gpu_timestamp_ns;
++
++	//! @ref frames still needs to be copied to @ref cams.
++	bool upload_pending;
++
++	//! Opacity of the forced passthrough over the layers, faded in and out.
++	float opacity;
++	int64_t last_update_ns;
++
++	//! This frame: draw the passthrough, and whether behind the layers (over them when @ref opacity > 0).
++	bool enabled;
++	bool background;
++
++	//! Once a second log line for debugging (XRT_PASSTHROUGH_STATS=1).
++	struct
++	{
++		bool enabled;
++		int64_t window_start_ns;
++		uint32_t frames, drawn, no_images, pose_failed, uploads;
++		double max_age_ms;
++		double brightness_min, brightness_max;
++		//! Largest change of the capture time head pose between two queries for the same image, degrees.
++		double max_requery_deg;
++		struct xrt_pose last_pose;
++		int64_t last_pose_ts;
++	} stats;
++
++	//! Settings, also in the debug UI.
++	struct
++	{
++		float radius_m;
++		float gain;
++		float fade_s;
++		//! Force on from the debug UI.
++		bool force;
++		//! Debug: use the display time head pose, the image then follows the head instead of the world.
++		bool head_locked;
++	} settings;
++};
++
++/*!
++ * Init, does not allocate any Vulkan resources until passthrough is first used.
++ */
++void
++comp_passthrough_init(struct comp_passthrough *pt, struct vk_bundle *vk);
++
++/*!
++ * Free all resources, the GPU must be idle.
++ */
++void
++comp_passthrough_fini(struct comp_passthrough *pt);
++
++/*!
++ * Poll the device once per frame, returns whether the passthrough is drawn this frame.
++ *
++ * @param blend_mode The environment blend mode the frame is submitted with.
++ */
++bool
++comp_passthrough_update(struct comp_passthrough *pt,
++                        struct xrt_device *xdev,
++                        enum xrt_blend_mode blend_mode,
++                        int64_t now_ns);
++
++/*!
++ * Record copying new camera images into the images, before the layer squasher reads them.
++ */
++void
++comp_passthrough_record_upload(struct comp_passthrough *pt, VkCommandBuffer cmd);
++
++/*!
++ * Fill in the data for the layer squasher.
++ *
++ * @param first_overlay_layer Index of the first overlay session layer, the forced passthrough goes under it.
++ */
++void
++comp_passthrough_fill_render_data(struct comp_passthrough *pt,
++                                  struct xrt_device *xdev,
++                                  int64_t display_time_ns,
++                                  uint32_t first_overlay_layer,
++                                  struct comp_render_passthrough_data *out);
++
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/xrt/compositor/main/comp_renderer.c b/src/xrt/compositor/main/comp_renderer.c
+index f6c4030..72ecd0f 100644
+--- a/src/xrt/compositor/main/comp_renderer.c
++++ b/src/xrt/compositor/main/comp_renderer.c
+@@ -36,6 +36,7 @@
+ 
+ #include "main/comp_frame.h"
+ #include "main/comp_mirror_to_debug_gui.h"
++#include "main/comp_passthrough.h"
+ 
+ #ifdef XRT_FEATURE_WINDOW_PEEK
+ #include "main/comp_window_peek.h"
+@@ -128,6 +129,9 @@ struct comp_renderer
+ 
+ 	struct comp_mirror_to_debug_gui mirror_to_debug_gui;
+ 
++	//! Camera passthrough, drawn by the compute layer squasher.
++	struct comp_passthrough passthrough;
++
+ 	//! @}
+ 
+ 	//! @name Image-dependent members
+@@ -628,6 +632,8 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
+ 		COMP_ERROR(c, "comp_mirror_init: %s", vk_result_string(ret));
+ 		assert(false && "Whelp, can't return a error. But should never really fail.");
+ 	}
++
++	comp_passthrough_init(&r->passthrough, vk);
+ }
+ 
+ static void
+@@ -866,6 +872,9 @@ renderer_fini(struct comp_renderer *r)
+ 	// Do before layer render just in case it holds any references.
+ 	comp_mirror_fini(&r->mirror_to_debug_gui, vk);
+ 
++	// The queue is idle after closing the renderings.
++	comp_passthrough_fini(&r->passthrough);
++
+ 	// Do this after the layer renderer.
+ 	chl_scratch_free_resources(&r->c->scratch, &r->c->nr);
+ }
+@@ -989,19 +998,43 @@ dispatch_compute(struct comp_renderer *r,
+ 	struct render_viewport_data target_viewport_datas[XRT_MAX_VIEWS];
+ 	calc_viewport_data(r, target_viewport_datas, render->r->view_count);
+ 
+-	// Does everything.
+-	chl_frame_state_cs_default_pipeline( //
+-	    frame_state,                     //
+-	    render,                          //
+-	    layers,                          //
+-	    layer_count,                     //
+-	    world_poses_scanout_begin,       //
+-	    world_poses_scanout_end,         //
+-	    eye_poses,                       //
+-	    fovs,                            //
+-	    target_image,                    //
+-	    target_storage_view,             //
+-	    target_viewport_datas);          //
++	// Same as chl_frame_state_cs_default_pipeline, plus the camera passthrough upload.
++	chl_frame_state_cs_set_views(  //
++	    frame_state,               //
++	    world_poses_scanout_begin, //
++	    world_poses_scanout_end,   //
++	    eye_poses,                 //
++	    fovs,                      //
++	    layer_count);              //
++
++	chl_frame_state_cs_set_target( //
++	    frame_state,               //
++	    target_image,              //
++	    target_storage_view,       //
++	    target_viewport_datas);    //
++
++	// Start the compute pipeline.
++	render_compute_begin(render);
++
++	// New camera images go in before the layer squasher reads them.
++	comp_passthrough_record_upload(&r->passthrough, render->r->cmd);
++	uint32_t overlay_layers = MIN(c->base.layer_accum.data.overlay_layer_count, layer_count);
++	comp_passthrough_fill_render_data(                //
++	    &r->passthrough,                              // pt
++	    c->xdev,                                      // xdev
++	    c->frame.rendering.predicted_display_time_ns, // display_time_ns
++	    layer_count - overlay_layers,                 // first_overlay_layer
++	    &frame_state->data.passthrough);              // out
++
++	// Build the command buffer.
++	comp_render_cs_dispatch( //
++	    render,              //
++	    layers,              //
++	    layer_count,         //
++	    &frame_state->data); //
++
++	// Make the command buffer submittable.
++	render_compute_end(render);
+ 
+ 	// Everything is ready, submit to the queue.
+ 	ret = renderer_submit_queue(r, render->r->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+@@ -1062,7 +1095,17 @@ comp_renderer_draw(struct comp_renderer *r)
+ 	const uint32_t view_count = c->nr.view_count;
+ 	enum comp_target_fov_source fov_source = COMP_TARGET_FOV_SOURCE_DISTORTION;
+ 
+-	bool fast_path = c->base.frame_params.one_projection_layer_fast_path;
++	// Camera passthrough is only drawn by the compute layer squasher, so it needs the full path.
++	bool passthrough = false;
++	if (r->settings->use_compute) {
++		passthrough = comp_passthrough_update(       //
++		    &r->passthrough,                         // pt
++		    c->xdev,                                 // xdev
++		    c->base.layer_accum.data.env_blend_mode, // blend_mode
++		    os_monotonic_get_ns());                  // now_ns
++	}
++
++	bool fast_path = c->base.frame_params.one_projection_layer_fast_path && !passthrough;
+ 	bool do_timewarp = !c->debug.atw_off;
+ 
+ 	// Consistency check.
+diff --git a/src/xrt/compositor/multi/comp_multi_system.c b/src/xrt/compositor/multi/comp_multi_system.c
+index 4db9234..7931f0d 100644
+--- a/src/xrt/compositor/multi/comp_multi_system.c
++++ b/src/xrt/compositor/multi/comp_multi_system.c
+@@ -308,10 +308,19 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
+ 	// find first (ordered by bottom to top) active client to retrieve xrt_layer_frame_data
+ 	const enum xrt_blend_mode blend_mode = find_active_blend_mode(array, count);
+ 
++	// Overlay sessions are sorted after the main app (z_order INT64_MIN), count their layers.
++	uint32_t overlay_layer_count = 0;
++	for (size_t k = 0; k < count; k++) {
++		if (array[k]->state.z_order != INT64_MIN) {
++			overlay_layer_count += array[k]->delivered.layer_count;
++		}
++	}
++
+ 	const struct xrt_layer_frame_data data = {
+ 	    .frame_id = system_frame_id,
+ 	    .display_time_ns = display_time_ns,
+ 	    .env_blend_mode = blend_mode,
++	    .overlay_layer_count = overlay_layer_count,
+ 	};
+ 	xrt_comp_layer_begin(xc, &data);
+ 
+diff --git a/src/xrt/compositor/shaders/layer.comp b/src/xrt/compositor/shaders/layer.comp
+index 528e0e0..0007d26 100644
+--- a/src/xrt/compositor/shaders/layer.comp
++++ b/src/xrt/compositor/shaders/layer.comp
+@@ -475,6 +475,57 @@ vec4 do_quad(vec2 view_uv, uint layer)
+ 	return vec4(colour);
+ }
+ 
++/*
++ * Camera passthrough, a pseudo layer filled in by the compositor (not by apps):
++ * - transform:   camera from view (camera space: OpenCV, +z forward, +y down)
++ * - mv_inverse:  Fisheye62 intrinsics, columns [fx fy cx cy] [k1 k2 k3 k4] [k5 k6 p1 p2]
++ *                [sphere radius, 1/width, 1/height, unused]
++ *
++ * Every view ray hits a sphere around the eye at the given radius, that point is projected into the camera.
++ */
++vec4 do_passthrough(vec2 view_uv, uint layer)
++{
++	uint source_image_index = LAYER.image_info.color_image_index;
++	vec4 proj = LAYER.mv_inverse[0];
++	vec4 ka = LAYER.mv_inverse[1];
++	vec4 kb = LAYER.mv_inverse[2];
++	vec4 misc = LAYER.mv_inverse[3];
++
++	vec3 dir = get_direction(view_uv);
++	vec3 p = (LAYER.transform * vec4(dir * misc.x, 1.0)).xyz;
++
++	// Fisheye62, the same model as the Rift S firmware calibration
++	float r = length(p.xy);
++	float theta = atan(r, p.z);
++	if (theta > 1.65) {
++		// Behind the lens' field of view
++		return vec4(0, 0, 0, 1);
++	}
++
++	vec2 xp = r > 1e-8 ? p.xy * (theta / r) : vec2(0.0);
++	float t2 = theta * theta;
++	float r_theta =
++	    1.0 + t2 * (ka.x + t2 * (ka.y + t2 * (ka.z + t2 * (ka.w + t2 * (kb.x + t2 * kb.y)))));
++	float p1 = kb.z;
++	float p2 = kb.w;
++	vec2 delta = vec2(2.0 * p1 * xp.x * xp.y + p2 * (t2 + 2.0 * xp.x * xp.x),
++	                  2.0 * p2 * xp.x * xp.y + p1 * (t2 + 2.0 * xp.y * xp.y));
++	vec2 m = xp * r_theta + delta;
++
++	// Pixel centres are at integer coordinates
++	vec2 pixel = vec2(proj.x * m.x + proj.z, proj.y * m.y + proj.w);
++	vec2 uv = (pixel + 0.5) * misc.yz;
++	if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
++		return vec4(0, 0, 0, 1);
++	}
++
++	// The camera values look right shown as they are, so treat them as sRGB encoded
++	float v = texture(source[source_image_index], uv).r;
++	float lin = v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
++
++	return vec4(lin, lin, lin, 1.0);
++}
++
+ vec4 do_layers(vec2 view_uv)
+ {
+ 	vec4 accum = vec4(0, 0, 0, 0);
+@@ -496,6 +547,9 @@ vec4 do_layers(vec2 view_uv)
+ 		case LAYER_COMP_TYPE_PROJECTION:
+ 			rgba = do_projection(view_uv, layer);
+ 			break;
++		case LAYER_COMP_TYPE_PASSTHROUGH:
++			rgba = do_passthrough(view_uv, layer);
++			break;
+ 		default: break;
+ 		}
+ 
+diff --git a/src/xrt/compositor/shaders/layer_defines.inc.glsl b/src/xrt/compositor/shaders/layer_defines.inc.glsl
+index 9f601c7..9e1fe9f 100644
+--- a/src/xrt/compositor/shaders/layer_defines.inc.glsl
++++ b/src/xrt/compositor/shaders/layer_defines.inc.glsl
+@@ -18,5 +18,6 @@
+ #define LAYER_COMP_TYPE_EQUIRECT2 3
+ //! Maps to XRT_LAYER_PROJECTION[_DEPTH] (not numerically)
+ #define LAYER_COMP_TYPE_PROJECTION 4
++#define LAYER_COMP_TYPE_PASSTHROUGH 5
+ 
+ #endif // LAYER_DEFINES_INC_GLSL
+diff --git a/src/xrt/compositor/util/comp_render.h b/src/xrt/compositor/util/comp_render.h
+index bd7ab29..c74f8c3 100644
+--- a/src/xrt/compositor/util/comp_render.h
++++ b/src/xrt/compositor/util/comp_render.h
+@@ -157,6 +157,47 @@ struct comp_render_view_data
+ 	} target; // When used as a destination.
+ };
+ 
++/*!
++ * Camera passthrough drawn as a pseudo layer by the layer squasher (compute path only).
++ *
++ * @ingroup comp_render
++ */
++struct comp_render_passthrough_data
++{
++	//! Draw the passthrough this frame.
++	bool enabled;
++
++	//! Draw behind all layers (alpha blend environment mode).
++	bool background;
++
++	//! How much of the camera image to show over the app's layers, 0 to 1, 0 = not drawn over them.
++	float opacity;
++
++	//! Index of the first overlay session layer, the camera image goes over the layers before it.
++	uint32_t first_overlay_layer;
++
++	//! Brightness multiplier for the camera image.
++	float gain;
++
++	//! Distance of the sphere the camera image is projected on, in meters.
++	float radius_m;
++
++	struct
++	{
++		//! Camera image, R8, in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
++		VkImageView image_view;
++
++		//! Camera pose at capture time, same space as the view poses. OpenCV camera axes.
++		struct xrt_pose world_from_camera;
++
++		//! Fisheye62 intrinsics, see layer.comp: fx fy cx cy, k1..k6, p1 p2.
++		float intrinsics[12];
++
++		//! Image size in pixels.
++		uint32_t width, height;
++	} views[XRT_MAX_VIEWS];
++};
++
+ /*!
+  * The input data needed for a complete layer squashing distortion rendering
+  * to a target. This struct is shared between GFX and CS paths.
+@@ -179,6 +220,9 @@ struct comp_render_dispatch_data
+ 	//! Very often true, can be disabled for debugging.
+ 	bool do_timewarp;
+ 
++	//! Camera passthrough, only used by the compute path.
++	struct comp_render_passthrough_data passthrough;
++
+ 	struct
+ 	{
+ 		//! Has this struct been setup to use the target.
+@@ -607,6 +651,7 @@ comp_render_cs_add_target_view(struct comp_render_dispatch_data *data,
+  * @param target_image_view
+  * @param target_view
+  * @param do_timewarp
++ * @param passthrough Camera passthrough to draw as a pseudo layer, may be NULL.
+  */
+ void
+ comp_render_cs_layer(struct render_compute *render,
+@@ -620,7 +665,8 @@ comp_render_cs_layer(struct render_compute *render,
+                      const VkImage target_image,
+                      const VkImageView target_image_view,
+                      const struct render_viewport_data *target_view,
+-                     bool do_timewarp);
++                     bool do_timewarp,
++                     const struct comp_render_passthrough_data *passthrough);
+ 
+ /*!
+  * Dispatch the layer squasher, on any number of views.
+diff --git a/src/xrt/compositor/util/comp_render_cs.c b/src/xrt/compositor/util/comp_render_cs.c
+index a2b6e0d..5cd38fc 100644
+--- a/src/xrt/compositor/util/comp_render_cs.c
++++ b/src/xrt/compositor/util/comp_render_cs.c
+@@ -540,6 +540,54 @@ crc_distortion_fast_path(struct render_compute *render,
+ }
+ 
+ 
++/// Data setup for the camera passthrough pseudo layer, see do_passthrough in layer.comp
++static inline void
++do_cs_passthrough_layer(const struct comp_render_passthrough_data *pt,
++                        float opacity,
++                        const struct xrt_pose *world_pose_scanout_begin,
++                        uint32_t view_index,
++                        uint32_t cur_layer,
++                        uint32_t cur_image,
++                        VkSampler clamp_to_border_black,
++                        VkSampler src_samplers[RENDER_MAX_IMAGES_SIZE],
++                        VkImageView src_image_views[RENDER_MAX_IMAGES_SIZE],
++                        struct render_compute_layer_ubo_data *ubo_data,
++                        uint32_t *out_cur_image)
++{
++	const uint32_t cam_index = view_index < XRT_MAX_VIEWS ? view_index : 0;
++
++	src_samplers[cur_image] = clamp_to_border_black;
++	src_image_views[cur_image] = pt->views[cam_index].image_view;
++	ubo_data->layers[cur_layer].image_info.color_image_index = cur_image++;
++
++	// Camera from view: the view ray in eye space ends up in the camera at capture time
++	struct xrt_matrix_4x4 camera_from_world, world_from_view;
++	math_matrix_4x4_view_from_pose(&pt->views[cam_index].world_from_camera, &camera_from_world);
++	math_matrix_4x4_isometry_from_pose(world_pose_scanout_begin, &world_from_view);
++	math_matrix_4x4_multiply(&camera_from_world, &world_from_view, &ubo_data->layers[cur_layer].transforms_timewarp);
++
++	// Intrinsics packed column by column, see layer.comp
++	const float *in = pt->views[cam_index].intrinsics;
++	float *packed = ubo_data->layers[cur_layer].mv_inverse.v;
++	for (int i = 0; i < 12; i++) {
++		packed[i] = in[i];
++	}
++	packed[12] = pt->radius_m;
++	packed[13] = 1.0f / (float)pt->views[cam_index].width;
++	packed[14] = 1.0f / (float)pt->views[cam_index].height;
++	packed[15] = 0.0f;
++
++	ubo_data->layers[cur_layer].layer_data.layer_type = LAYER_COMP_TYPE_PASSTHROUGH;
++	// Mix by alpha, so the opacity in the color scale fades the camera image over the layers
++	ubo_data->layers[cur_layer].layer_data.unpremultiplied_alpha = true;
++
++	ubo_data->layers[cur_layer].color_scale = (struct xrt_colour_rgba_f32){pt->gain, pt->gain, pt->gain, opacity};
++	ubo_data->layers[cur_layer].color_bias = (struct xrt_colour_rgba_f32){0, 0, 0, 0};
++
++	*out_cur_image = cur_image;
++}
++
++
+ /*
+  *
+  * 'Exported' function(s).
+@@ -558,7 +606,8 @@ comp_render_cs_layer(struct render_compute *render,
+                      const VkImage target_image,
+                      const VkImageView target_image_view,
+                      const struct render_viewport_data *target_view,
+-                     bool do_timewarp)
++                     bool do_timewarp,
++                     const struct comp_render_passthrough_data *passthrough)
+ {
+ 	VkSampler clamp_to_edge = render->r->samplers.clamp_to_edge;
+ 	VkSampler clamp_to_border_black = render->r->samplers.clamp_to_border_black;
+@@ -582,10 +631,50 @@ comp_render_cs_layer(struct render_compute *render,
+ 	ubo_data->view = *target_view;
+ 	ubo_data->pre_transform = *pre_transform;
+ 
++	// Camera passthrough takes one layer and one image behind the app layers, and/or one over them
++	const bool do_passthrough = passthrough != NULL && passthrough->enabled;
++	const bool passthrough_over = do_passthrough && passthrough->opacity > 0.0f;
++	const uint32_t passthrough_reserve = passthrough_over ? 1 : 0;
++
++	if (do_passthrough && passthrough->background) {
++		do_cs_passthrough_layer(      //
++		    passthrough,              // pt
++		    1.0f,                     // opacity
++		    world_pose_scanout_begin, // world_pose_scanout_begin
++		    view_index,               // view_index
++		    cur_layer,                // cur_layer
++		    cur_image,                // cur_image
++		    clamp_to_border_black,    // clamp_to_border_black
++		    src_samplers,             // src_samplers
++		    src_image_views,          // src_image_views
++		    ubo_data,                 // ubo_data
++		    &cur_image);              // out_cur_image
++		cur_layer++;
++	}
++
++	bool passthrough_over_done = false;
+ 	for (uint32_t c_layer_i = 0; c_layer_i < layer_count; c_layer_i++) {
+ 		const struct comp_layer *layer = &layers[c_layer_i];
+ 		const struct xrt_layer_data *data = &layer->data;
+ 
++		// Over the app's layers, under overlay apps (WayVR stays usable on top of the room).
++		if (passthrough_over && !passthrough_over_done && c_layer_i >= passthrough->first_overlay_layer) {
++			do_cs_passthrough_layer(      //
++			    passthrough,              // pt
++			    passthrough->opacity,     // opacity
++			    world_pose_scanout_begin, // world_pose_scanout_begin
++			    view_index,               // view_index
++			    cur_layer,                // cur_layer
++			    cur_image,                // cur_image
++			    clamp_to_border_black,    // clamp_to_border_black
++			    src_samplers,             // src_samplers
++			    src_image_views,          // src_image_views
++			    ubo_data,                 // ubo_data
++			    &cur_image);              // out_cur_image
++			cur_layer++;
++			passthrough_over_done = true;
++		}
++
+ 		if (!is_layer_view_visible(data, view_index)) {
+ 			continue;
+ 		}
+@@ -609,8 +698,10 @@ comp_render_cs_layer(struct render_compute *render,
+ 			continue; // Skip this layer if don't know about it.
+ 		}
+ 
+-		//! Exit loop if shader cannot receive more image samplers
+-		if (cur_image + required_image_samplers > render->r->compute.layer.image_array_size) {
++		//! Exit loop if shader cannot receive more image samplers (or layers, keeping room for passthrough)
++		if (cur_image + required_image_samplers + passthrough_reserve >
++		        render->r->compute.layer.image_array_size ||
++		    cur_layer + passthrough_reserve >= RENDER_MAX_LAYERS) {
+ 			break;
+ 		}
+ 
+@@ -693,6 +784,22 @@ comp_render_cs_layer(struct render_compute *render,
+ 		cur_layer++;
+ 	}
+ 
++	if (passthrough_over && !passthrough_over_done) {
++		do_cs_passthrough_layer(      //
++		    passthrough,              // pt
++		    passthrough->opacity,     // opacity
++		    world_pose_scanout_begin, // world_pose_scanout_begin
++		    view_index,               // view_index
++		    cur_layer,                // cur_layer
++		    cur_image,                // cur_image
++		    clamp_to_border_black,    // clamp_to_border_black
++		    src_samplers,             // src_samplers
++		    src_image_views,          // src_image_views
++		    ubo_data,                 // ubo_data
++		    &cur_image);              // out_cur_image
++		cur_layer++;
++	}
++
+ 	// Set the number of layers.
+ 	ubo_data->layer_count.value = cur_layer;
+ 
+@@ -754,7 +861,8 @@ comp_render_cs_layers(struct render_compute *render,
+ 		    view->squash.image,              //
+ 		    view->squash.cs.storage_view,    //
+ 		    &view->squash.viewport_data,     //
+-		    d->do_timewarp);                 //
++		    d->do_timewarp,                  //
++		    &d->passthrough);                //
+ 	}
+ 
+ 	cmd_barrier_view_squash_images(            //
+@@ -819,8 +927,8 @@ comp_render_cs_dispatch(struct render_compute *render,
+ 		    layer,                //
+ 		    vds);                 //
+ 
+-	} else if (layer_count > 0) {
+-		// Compute layer squasher
++	} else if (layer_count > 0 || d->passthrough.enabled) {
++		// Compute layer squasher (also with no app layers, to draw the camera passthrough)
+ 		if (fast_path) {
+ 			U_LOG_W("Wanted fast path but no projection layer, falling back to layer squasher.");
+ 		}
+diff --git a/src/xrt/include/xrt/xrt_compositor.h b/src/xrt/include/xrt/xrt_compositor.h
+index c05232b..603422d 100644
+--- a/src/xrt/include/xrt/xrt_compositor.h
++++ b/src/xrt/include/xrt/xrt_compositor.h
+@@ -483,6 +483,12 @@ struct xrt_layer_frame_data
+ 	XRT_ALIGNAS(8) int64_t frame_id;
+ 	int64_t display_time_ns;
+ 	enum xrt_blend_mode env_blend_mode;
++
++	/*!
++	 * Number of layers at the end of the frame that come from overlay sessions (XR_EXTX_overlay), set by the
++	 * multi compositor for the native compositor. 0 if there are none or it is unknown.
++	 */
++	uint32_t overlay_layer_count;
+ };
+ 
+ 
+-- 
+2.54.0
+

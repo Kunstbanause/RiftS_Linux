@@ -1,0 +1,338 @@
+From 2ba56d72941ffa20f50da5c05662a127b08a8c8e Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 20:23:33 +0200
+Subject: [PATCH 7/7] d/rift_s: Replace the CV1 placeholder distortion with a
+ Rift S lens model
+
+The driver corrected the Rift S lenses with Rift CV1 values (74 mm lens
+separation, 105 degree FOV, CV1 coefficients), which makes the image warp
+and swim when turning the head and distorts depth at the view edges.
+
+- Read the per-unit lens calibration from firmware block 0x12 (lens
+  optical centres and eye-cup distances, in panel pixels).
+- Use the per-eye FOV and centre pixel density reported by the Oculus
+  runtime for the Rift S (hmdgdb OculusRiftS_Native_R80): left eye
+  L/R/U/D 44/46/45/49 degrees, 823.28 px per tangent, mirrored for the
+  right eye.
+- Map panel pixels to tangent angles around the lens centre with a
+  radial term tan = s (1 + c1 s^2 + c2 s^4); c1 = 0.47 fitted to the
+  eye-cup distances at the FOV edges. RIFT_S_DISTORTION_C1/_C2 tune it,
+  RIFT_S_DISTORTION=cv1 restores the old placeholder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s.c          | 22 ++++++
+ src/xrt/drivers/rift_s/rift_s.h          |  4 +
+ src/xrt/drivers/rift_s/rift_s_firmware.c | 36 +++++++++
+ src/xrt/drivers/rift_s/rift_s_firmware.h | 15 ++++
+ src/xrt/drivers/rift_s/rift_s_hmd.c      | 94 +++++++++++++++++++++++-
+ src/xrt/drivers/rift_s/rift_s_hmd.h      | 22 ++++++
+ 6 files changed, 191 insertions(+), 2 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s.c b/src/xrt/drivers/rift_s/rift_s.c
+index e7130ec..b79b828 100644
+--- a/src/xrt/drivers/rift_s/rift_s.c
++++ b/src/xrt/drivers/rift_s/rift_s.c
+@@ -103,6 +103,22 @@ read_hmd_proximity_threshold(struct os_hid_device *hid_hmd, int *proximity_thres
+ 	return ret;
+ }
+ 
++static int
++read_hmd_lens_calibration(struct os_hid_device *hid_hmd, struct rift_s_lens_calibration *lens)
++{
++	char *json = NULL;
++	int json_len = 0;
++
++	int ret = rift_s_read_firmware_block(hid_hmd, RIFT_S_FIRMWARE_BLOCK_LENS_CALIB, &json, &json_len);
++	if (ret < 0)
++		return ret;
++
++	ret = rift_s_parse_lens_calibration(json, lens);
++	free(json);
++
++	return ret;
++}
++
+ static int
+ read_hmd_config(struct os_hid_device *hid_hmd, struct rift_s_hmd_config *config)
+ {
+@@ -139,6 +155,12 @@ read_hmd_config(struct os_hid_device *hid_hmd, struct rift_s_hmd_config *config)
+ 		return ret;
+ 	}
+ 
++	// Optional: older firmware may not have it, the HMD falls back to typical values
++	config->have_lens_calibration = read_hmd_lens_calibration(hid_hmd, &config->lens_calibration) == 0;
++	if (!config->have_lens_calibration) {
++		RIFT_S_WARN("Could not read the lens calibration, using typical values");
++	}
++
+ 	ret = read_camera_calibration(hid_hmd, &config->camera_calibration);
+ 	if (ret < 0) {
+ 		RIFT_S_ERROR("Failed to read HMD camera calibration block");
+diff --git a/src/xrt/drivers/rift_s/rift_s.h b/src/xrt/drivers/rift_s/rift_s.h
+index 00a545f..740c165 100644
+--- a/src/xrt/drivers/rift_s/rift_s.h
++++ b/src/xrt/drivers/rift_s/rift_s.h
+@@ -62,6 +62,10 @@ struct rift_s_hmd_config
+ 
+ 	struct rift_s_imu_config_info_t imu_config_info;
+ 	struct rift_s_imu_calibration imu_calibration;
++
++	/* Lens calibration block from firmware, if available */
++	bool have_lens_calibration;
++	struct rift_s_lens_calibration lens_calibration;
+ };
+ 
+ /* Structure to track online devices and type */
+diff --git a/src/xrt/drivers/rift_s/rift_s_firmware.c b/src/xrt/drivers/rift_s/rift_s_firmware.c
+index 1b5a43d..76cd536 100644
+--- a/src/xrt/drivers/rift_s/rift_s_firmware.c
++++ b/src/xrt/drivers/rift_s/rift_s_firmware.c
+@@ -54,6 +54,42 @@ fail:
+ 	return -1;
+ }
+ 
++int
++rift_s_parse_lens_calibration(char *json_string, struct rift_s_lens_calibration *lens)
++{
++	cJSON *json_root = cJSON_Parse(json_string);
++	if (!cJSON_IsObject(json_root)) {
++		RIFT_S_ERROR("Could not parse JSON lens calibration data.");
++		cJSON_Delete(json_root);
++		return -1;
++	}
++
++	static const char *eyes[2] = {"Left", "Right"};
++	static const char *edges[4] = {"Temporal", "Nasal", "Sky", "Ground"};
++	const cJSON *centers = u_json_get(json_root, "LensOpticalCenterPixelCoord");
++	const cJSON *eyecups = u_json_get(json_root, "LensCenterToEyeCupPixelDistance");
++
++	for (int eye = 0; eye < 2; eye++) {
++		if (u_json_get_float_array(u_json_get(centers, eyes[eye]), lens->center_px[eye], 2) != 2) {
++			goto fail;
++		}
++		const cJSON *cup = u_json_get(eyecups, eyes[eye]);
++		for (int e = 0; e < 4; e++) {
++			if (!JSON_FLOAT(cup, edges[e], &lens->eyecup_px[eye][e])) {
++				goto fail;
++			}
++		}
++	}
++
++	cJSON_Delete(json_root);
++	return 0;
++
++fail:
++	RIFT_S_WARN("Unrecognised Rift S lens calibration JSON data.\n%s", json_string);
++	cJSON_Delete(json_root);
++	return -1;
++}
++
+ static bool
+ check_file_format_version(cJSON *json_root, float expected_version, float *version_number)
+ {
+diff --git a/src/xrt/drivers/rift_s/rift_s_firmware.h b/src/xrt/drivers/rift_s/rift_s_firmware.h
+index b7a36a6..2322692 100644
+--- a/src/xrt/drivers/rift_s/rift_s_firmware.h
++++ b/src/xrt/drivers/rift_s/rift_s_firmware.h
+@@ -47,6 +47,18 @@ static const enum rift_s_camera_id CAM_IDX_TO_ID[RIFT_S_CAMERA_COUNT] = {
+     RIFT_S_CAMERA_TOP,
+ };
+ 
++/*!
++ * Per-unit lens calibration (firmware block 0x12), in panel pixel coordinates
++ * of the 2560x1440 landscape panel, left eye first.
++ */
++struct rift_s_lens_calibration
++{
++	//! Lens optical centre, [eye][x, y]
++	float center_px[2][2];
++	//! Distance from the lens centre to the eye cup edge, [eye][temporal, nasal, sky, ground]
++	float eyecup_px[2][4];
++};
++
+ struct rift_s_imu_calibration
+ {
+ 	struct xrt_matrix_4x4 device_from_imu;
+@@ -142,6 +154,9 @@ struct rift_s_controller_imu_calibration
+ 
+ int
+ rift_s_parse_proximity_threshold(char *json, int *proximity_threshold);
++
++int
++rift_s_parse_lens_calibration(char *json, struct rift_s_lens_calibration *lens);
+ int
+ rift_s_parse_imu_calibration(char *json, struct rift_s_imu_calibration *c);
+ int
+diff --git a/src/xrt/drivers/rift_s/rift_s_hmd.c b/src/xrt/drivers/rift_s/rift_s_hmd.c
+index edfad46..235e22a 100644
+--- a/src/xrt/drivers/rift_s/rift_s_hmd.c
++++ b/src/xrt/drivers/rift_s/rift_s_hmd.c
+@@ -32,6 +32,7 @@
+ 
+ #include "os/os_time.h"
+ 
++#include "util/u_debug.h"
+ #include "util/u_device.h"
+ #include "util/u_trace_marker.h"
+ #include "util/u_var.h"
+@@ -40,6 +41,16 @@
+ 
+ #include "rift_s_hmd.h"
+ 
++//! Eye view size as the client renders it (the panel is 1440x2560 rotated, split in two)
++#define RIFT_S_VIEW_W 1280
++#define RIFT_S_VIEW_H 1440
++
++//! "cv1" selects the old Rift CV1 placeholder distortion
++DEBUG_GET_ONCE_OPTION(rift_s_distortion, "RIFT_S_DISTORTION", NULL)
++//! Radial correction terms of the Rift S lens model, see struct rift_s_lens_model
++DEBUG_GET_ONCE_FLOAT_OPTION(rift_s_distortion_c1, "RIFT_S_DISTORTION_C1", 0.47f)
++DEBUG_GET_ONCE_FLOAT_OPTION(rift_s_distortion_c2, "RIFT_S_DISTORTION_C2", 0.0f)
++
+ 
+ static xrt_result_t
+ rift_s_get_tracked_pose(struct xrt_device *xdev,
+@@ -153,10 +164,80 @@ static xrt_result_t
+ rift_s_compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
+ {
+ 	struct rift_s_hmd *hmd = (struct rift_s_hmd *)(xdev);
+-	u_compute_distortion_panotools(&hmd->distortion_vals[view], u, v, result);
++	if (hmd->use_cv1_distortion) {
++		u_compute_distortion_panotools(&hmd->distortion_vals[view], u, v, result);
++		return XRT_SUCCESS;
++	}
++
++	const struct rift_s_lens_model *l = &hmd->lens[view];
++
++	// Panel pixel offset from the lens centre, v grows downwards like the panel rows
++	const float dx = u * RIFT_S_VIEW_W - l->center_px[0];
++	const float dy = v * RIFT_S_VIEW_H - l->center_px[1];
++	const float sx = dx / l->pixels_per_tan;
++	const float sy = dy / l->pixels_per_tan;
++	const float s2 = sx * sx + sy * sy;
++	const float radial = 1.0f + l->c1 * s2 + l->c2 * s2 * s2;
++
++	struct xrt_vec2 *out[3] = {&result->r, &result->g, &result->b};
++	for (int i = 0; i < 3; i++) {
++		const float tan_x = sx * radial * l->aberration[i];
++		const float tan_y_down = sy * radial * l->aberration[i];
++		out[i]->x = (tan_x - l->tan_left) / (l->tan_right - l->tan_left);
++		out[i]->y = (tan_y_down + l->tan_up) / (l->tan_up + l->tan_down);
++	}
+ 	return XRT_SUCCESS;
+ }
+ 
++/*!
++ * Set up the Rift S lens model from the firmware lens calibration (lens centres) and the
++ * per-eye FOV / centre pixel density the Oculus runtime reports for the Rift S
++ * (hmdgdb OculusRiftS_Native_R80, runtime 1.82): left eye left/right/up/down tangents
++ * 0.965689 / 1.035530 / 1.0 / 1.150368, 823.28 pixels per tangent, mirrored for the right
++ * eye. The radial term c1 is fitted to the firmware eye-cup distances at those FOV edges.
++ */
++static void
++rift_s_setup_lens_model(struct rift_s_hmd *hmd, struct rift_s_hmd_config *config)
++{
++	// Fallback: values read from one Rift S, firmware block 0x12
++	float centers[2][2] = {{609, 718}, {1952, 718}};
++	if (config->have_lens_calibration) {
++		memcpy(centers, config->lens_calibration.center_px, sizeof(centers));
++	}
++
++	const float c1 = debug_get_float_option_rift_s_distortion_c1();
++	const float c2 = debug_get_float_option_rift_s_distortion_c2();
++
++	for (int eye = 0; eye < 2; eye++) {
++		struct rift_s_lens_model *l = &hmd->lens[eye];
++		// Firmware coordinates span the whole 2560 wide panel, left eye first
++		l->center_px[0] = centers[eye][0] - (float)(eye * RIFT_S_VIEW_W);
++		l->center_px[1] = centers[eye][1];
++		l->pixels_per_tan = 823.28f;
++		l->c1 = c1;
++		l->c2 = c2;
++		l->aberration[0] = 0.9952420f;
++		l->aberration[1] = 1.0f;
++		l->aberration[2] = 1.0008074f;
++
++		const float temporal = 0.965689f, nasal = 1.035530f;
++		l->tan_left = eye == 0 ? -temporal : -nasal;
++		l->tan_right = eye == 0 ? nasal : temporal;
++		l->tan_up = 1.0f;
++		l->tan_down = 1.150368f;
++
++		struct xrt_fov *fov = &hmd->base.hmd->distortion.fov[eye];
++		fov->angle_left = atanf(l->tan_left);
++		fov->angle_right = atanf(l->tan_right);
++		fov->angle_up = atanf(l->tan_up);
++		fov->angle_down = -atanf(l->tan_down);
++
++		RIFT_S_INFO("Lens model eye %d: centre %.0f,%.0f px, c1 %.3f c2 %.3f, FOV L %.1f R %.1f U %.1f D %.1f deg",
++		            eye, l->center_px[0], l->center_px[1], l->c1, l->c2, RAD_TO_DEG(fov->angle_left),
++		            RAD_TO_DEG(fov->angle_right), RAD_TO_DEG(fov->angle_up), RAD_TO_DEG(fov->angle_down));
++	}
++}
++
+ #if 0
+ static int
+ dump_fw_block(struct os_hid_device *handle, uint8_t block_id) {
+@@ -280,7 +361,8 @@ rift_s_hmd_create(struct rift_s_system *sys, const unsigned char *hmd_serial_no,
+ 	hmd->base.hmd->views[0].viewport.y_pixels = 0;
+ 	hmd->base.hmd->views[1].viewport.y_pixels = view_h;
+ 
+-	/* FIXME: Incorrection distortion taken from the Rift CV1 for now */
++	/* Old placeholder: distortion taken from the Rift CV1 (RIFT_S_DISTORTION=cv1). Its panotools
++	 * values are also kept as a fallback for the struct users. */
+ 	const double display_w_meters = 0.149760f / 2.0; // Per-eye width
+ 	const double display_h_meters = 0.093600f;
+ 	const double lens_sep = 0.074f;
+@@ -319,6 +401,14 @@ rift_s_hmd_create(struct rift_s_system *sys, const unsigned char *hmd_serial_no,
+ 	distortion_vals.lens_center.x = hCOP;
+ 	hmd->distortion_vals[1] = distortion_vals;
+ 
++	const char *distortion_mode = debug_get_option_rift_s_distortion();
++	hmd->use_cv1_distortion = distortion_mode != NULL && strcmp(distortion_mode, "cv1") == 0;
++	if (hmd->use_cv1_distortion) {
++		RIFT_S_INFO("Using the Rift CV1 placeholder distortion");
++	} else {
++		rift_s_setup_lens_model(hmd, config);
++	}
++
+ 	hmd->base.hmd->distortion.models = XRT_DISTORTION_MODEL_COMPUTE;
+ 	hmd->base.hmd->distortion.preferred = XRT_DISTORTION_MODEL_COMPUTE;
+ 	hmd->base.compute_distortion = rift_s_compute_distortion;
+diff --git a/src/xrt/drivers/rift_s/rift_s_hmd.h b/src/xrt/drivers/rift_s/rift_s_hmd.h
+index 5dbeb8c..ef8ce0a 100644
+--- a/src/xrt/drivers/rift_s/rift_s_hmd.h
++++ b/src/xrt/drivers/rift_s/rift_s_hmd.h
+@@ -47,6 +47,28 @@ struct rift_s_hmd
+ 
+ 	/* Temporary distortion values for mesh calc */
+ 	struct u_panotools_values distortion_vals[2];
++
++	//! Use the old Rift CV1 placeholder distortion instead of the Rift S lens model
++	bool use_cv1_distortion;
++
++	/*!
++	 * Rift S lens model per eye, in the eye view's pixel coordinates (1280x1440, as the
++	 * client sees it): panel pixel -> tangent angle around the lens centre, then into the
++	 * render texture that spans the FOV tangents.
++	 */
++	struct rift_s_lens_model
++	{
++		//! Lens optical centre (px)
++		float center_px[2];
++		//! Panel pixels per unit tangent at the lens centre
++		float pixels_per_tan;
++		//! Radial correction: tan = s * (1 + c1 s^2 + c2 s^4), s = r / pixels_per_tan
++		float c1, c2;
++		//! Per-colour tangent scale for chromatic aberration <r, g, b>
++		float aberration[3];
++		//! Render FOV tangents: tan_left < 0 < tan_right; tan_up, tan_down are positive magnitudes
++		float tan_left, tan_right, tan_up, tan_down;
++	} lens[2];
+ };
+ 
+ struct rift_s_hmd *
+-- 
+2.54.0
+

@@ -1,0 +1,189 @@
+From dc2d4375850ac86224a23d2c86650fa7d76b79d8 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:35:14 +0200
+Subject: [PATCH 4/7] d/rift_s: Only reset controller fusion on consistent
+ rejected fixes
+
+Real recordings show that most rejected optical fixes are wrong LED
+correspondences (35-100 degrees off). Resetting after any 4 consecutive
+rejections re-initialised the filter onto such bad poses. Now a reset
+needs 4 of the last 8 rejected fixes to share a common offset from the
+filter (3 cm / 0.15 rad), or no accepted fix for 1.5 s. The position
+innovation statistic is now measured before the correction.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rift_s/rift_s_controller_fusion.cpp       | 77 +++++++++++++++++--
+ .../drivers/rift_s/rift_s_controller_fusion.h |  8 +-
+ 2 files changed, 77 insertions(+), 8 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+index b48cf3e..195b6f3 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+@@ -56,6 +56,8 @@ constexpr int64_t HISTORY_NS = 400 * 1000 * 1000;
+ constexpr int64_t IMU_BUFFER_NS = 500 * 1000 * 1000;
+ //! Orientation integration step clamp for long IMU gaps
+ constexpr double MAX_GYRO_DT = 0.05;
++//! Number of recent rejected fixes considered when deciding on a reset
++constexpr size_t REJECT_WINDOW = 8;
+ 
+ //! Bias clamps, as in the OpenHMD filter
+ constexpr double MAX_GYRO_BIAS = 0.3;
+@@ -127,6 +129,18 @@ struct ImuSample
+ 	Vector3d accel;
+ };
+ 
++struct RejectedFix
++{
++	int64_t ts;
++	//! World-frame position offset of the fix from the filter
++	Vector3d dp;
++	//! World-frame rotation from the filter orientation to the fix orientation
++	Quaterniond dq;
++	//! The optical fix itself
++	Vector3d z_p;
++	Quaterniond z_q;
++};
++
+ struct HistoryEntry
+ {
+ 	int64_t ts;
+@@ -202,21 +216,31 @@ public:
+ 			propagate(x, P, s, ns_to_s(frame_ts - t), frame_ts, unused_w, unused_a);
+ 		}
+ 
++		// World-frame offset of the fix from the filter, before any correction
++		const RejectedFix offset{frame_ts, z_p - x.p, (z_q.normalized() * x.q.conjugate()).normalized(), z_p,
++		                         z_q.normalized()};
++		stats_.last_pos_innovation = (float)offset.dp.norm();
++
+ 		double chi2 = 0;
+ 		bool accepted = correct_pose(x, P, z_p, z_q, chi2);
+ 		stats_.last_chi2 = (float)chi2;
+-		stats_.last_pos_innovation = (float)(z_p - x.p).norm();
+ 
+ 		if (!accepted) {
+ 			stats_.poses_rejected++;
+-			if (++consecutive_rejects_ >= params_.reset_after_rejects) {
+-				reinit(frame_ts, z_p, z_q, true);
++			rejected_.push_back(offset);
++			while (rejected_.size() > REJECT_WINDOW) {
++				rejected_.pop_front();
++			}
++			const RejectedFix *reset_to = find_reset_target(frame_ts);
++			if (reset_to != nullptr) {
++				const RejectedFix target = *reset_to;
++				reinit(target.ts, target.z_p, target.z_q, true);
+ 				return RIFT_S_CTRL_FUSION_POSE_RESET;
+ 			}
+ 			return RIFT_S_CTRL_FUSION_POSE_REJECTED;
+ 		}
+ 
+-		consecutive_rejects_ = 0;
++		rejected_.clear();
+ 		stats_.poses_accepted++;
+ 		stats_.last_fix_delay = (float)ns_to_s(history_.back().ts - frame_ts);
+ 		last_fix_ts_ = std::max(last_fix_ts_, frame_ts);
+@@ -295,7 +319,7 @@ public:
+ 	reset()
+ 	{
+ 		initialised_ = false;
+-		consecutive_rejects_ = 0;
++		rejected_.clear();
+ 		last_fix_ts_ = 0;
+ 		imu_buf_.clear();
+ 		history_.clear();
+@@ -320,13 +344,49 @@ public:
+ 
+ private:
+ 	bool initialised_{false};
+-	int consecutive_rejects_{0};
++	//! Offsets of the optical fixes rejected since the last accepted one
++	std::deque<RejectedFix> rejected_;
+ 	int gravity_meas_counter_{0};
+ 	int64_t last_fix_ts_{0};
+ 
+ 	std::deque<ImuSample> imu_buf_;
+ 	std::deque<HistoryEntry> history_;
+ 
++	/*!
++	 * Decide whether rejections mean the filter (not the optical tracker) is
++	 * wrong: enough recently rejected fixes must agree with each other on a
++	 * common offset from the filter. Wrong LED correspondences produce scattered
++	 * offsets, a drifted filter produces a consistent cluster. If nothing has
++	 * been accepted for a long time, reset to the newest fix regardless.
++	 *
++	 * @return the fix to re-initialise from, or nullptr.
++	 */
++	const RejectedFix *
++	find_reset_target(int64_t now_ts) const
++	{
++		const size_t need = (size_t)std::max(1, params_.reset_after_rejects);
++		if (rejected_.size() < need) {
++			return nullptr;
++		}
++		if (ns_to_s(now_ts - last_fix_ts_) >= params_.reset_force_after) {
++			return &rejected_.back();
++		}
++		// Newest-first, find a fix whose offset is shared by enough others
++		for (auto it = rejected_.rbegin(); it != rejected_.rend(); ++it) {
++			size_t agree = 0;
++			for (const RejectedFix &r : rejected_) {
++				if ((r.dp - it->dp).norm() <= params_.reset_consistency_pos &&
++				    so3_log(r.dq * it->dq.conjugate()).norm() <= params_.reset_consistency_rot) {
++					agree++;
++				}
++			}
++			if (agree >= need) {
++				return &*it;
++			}
++		}
++		return nullptr;
++	}
++
+ 	bool
+ 	holding(int64_t ts) const
+ 	{
+@@ -362,7 +422,7 @@ private:
+ 
+ 		history_.clear();
+ 		initialised_ = true;
+-		consecutive_rejects_ = 0;
++		rejected_.clear();
+ 		last_fix_ts_ = frame_ts;
+ 		stats_.resets++;
+ 
+@@ -592,6 +652,9 @@ rift_s_ctrl_fusion_default_params(struct rift_s_ctrl_fusion_params *out)
+ 
+ 	out->gate_chi2 = 30.0f;
+ 	out->reset_after_rejects = 4;
++	out->reset_consistency_pos = 0.03f;
++	out->reset_consistency_rot = 0.15f;
++	out->reset_force_after = 1.5f;
+ 
+ 	out->coast_start = 0.2f;
+ 	out->coast_vel_tau = 0.2f;
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+index 366d1f0..ca8d115 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+@@ -50,8 +50,14 @@ struct rift_s_ctrl_fusion_params
+ 
+ 	//! Chi-squared gate on the 6-dof optical innovation (rejects bad LED matches)
+ 	float gate_chi2;
+-	//! Re-initialise from the optical pose after this many consecutive gate rejections
++	//! Re-initialise from the optical pose after this many consecutive gate rejections...
+ 	int reset_after_rejects;
++	//! ...if their offsets from the filter agree within this distance (m)...
++	float reset_consistency_pos;
++	//! ...and this rotation (rad), i.e. the filter drifted rather than the LED matches being wrong
++	float reset_consistency_rot;
++	//! Reset regardless of consistency once no fix was accepted for this long (s)
++	float reset_force_after;
+ 
+ 	//! Time without an accepted fix after which velocity starts decaying (s)
+ 	float coast_start;
+-- 
+2.54.0
+

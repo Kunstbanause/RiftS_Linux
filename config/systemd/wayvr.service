@@ -1,0 +1,20 @@
+# WayVR overlay as part of the VR stack: started with Monado, stopped / restarted with it.
+# Written by rift-s-linux setup. Runs the extracted AppImage (~/.local/opt/wayvr/current):
+# the FUSE-mounted AppImage dies with SIGBUS + core dump on every stop.
+# Desktop capture instead of headless: the GUI's Tools tab (drop-in with Environment=WAYVR_MODE=).
+[Unit]
+Description=WayVR overlay for Monado
+After=monado.service
+BindsTo=monado.service
+
+[Service]
+Environment=WAYVR_MODE=--headless
+ExecStart=%h/.local/opt/wayvr/current/AppRun --openxr $WAYVR_MODE
+Restart=on-failure
+RestartSec=3
+# It hung on stop after the headset was unplugged: stop quickly (TimeoutStopFailureMode=kill is in
+# wayvr.service.d/50-stop.conf, because Fedora's 10-timeout-abort.conf drop-in would override it here)
+TimeoutStopSec=5
+
+[Install]
+WantedBy=monado.service

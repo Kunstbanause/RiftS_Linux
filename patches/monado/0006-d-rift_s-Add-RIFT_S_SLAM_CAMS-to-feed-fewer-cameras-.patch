@@ -1,0 +1,81 @@
+From 9e5c53ec357d0ad688bf80d7115fd3138c82f827 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 20:03:10 +0200
+Subject: [PATCH 6/7] d/rift_s: Add RIFT_S_SLAM_CAMS to feed fewer cameras to
+ SLAM
+
+Head tracking with all 5 cameras costs most of Monado's CPU time, which
+on APU laptops competes with the GPU for the shared power budget.
+RIFT_S_SLAM_CAMS=N (1-5, default 5) feeds only the first N cameras in
+index order (front-left, front-right, side-left, side-right, top) to
+SLAM; controller tracking still uses all cameras. Measured on a Ryzen
+AI 300 laptop with the headset static: 5 cams 2.58 cores, 3 cams 2.33,
+2 cams 1.75.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_tracker.c | 26 ++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_tracker.c b/src/xrt/drivers/rift_s/rift_s_tracker.c
+index 11c8322..67e80b1 100644
+--- a/src/xrt/drivers/rift_s/rift_s_tracker.c
++++ b/src/xrt/drivers/rift_s/rift_s_tracker.c
+@@ -71,6 +71,20 @@ DEBUG_GET_ONCE_BOOL_OPTION(rift_s_handtracking, "RIFT_S_HANDTRACKING", true)
+ DEBUG_GET_ONCE_OPTION(slam_submit_from_start, "SLAM_SUBMIT_FROM_START", NULL)
+ #endif
+ 
++/*!
++ * Number of cameras fed to the SLAM tracker, in index order front-left,
++ * front-right, side-left, side-right, top. Fewer cameras use less CPU at the
++ * cost of tracking robustness (e.g. 2 = front stereo pair only).
++ */
++DEBUG_GET_ONCE_NUM_OPTION(rift_s_slam_cams, "RIFT_S_SLAM_CAMS", RIFT_S_CAMERA_COUNT)
++
++static int
++rift_s_slam_cam_count(void)
++{
++	int n = (int)debug_get_num_option_rift_s_slam_cams();
++	return n < 1 ? 1 : (n > RIFT_S_CAMERA_COUNT ? RIFT_S_CAMERA_COUNT : n);
++}
++
+ static xrt_result_t
+ rift_s_tracker_get_tracked_pose_imu(struct xrt_device *xdev,
+                                     enum xrt_input_name name,
+@@ -167,8 +181,8 @@ rift_s_fill_slam_cameras_calibration(struct rift_s_tracker *t, struct rift_s_hmd
+ 	math_pose_from_isometry(&hmd_config->imu_calibration.device_from_imu, &device_from_imu);
+ 	math_pose_invert(&device_from_imu, &imu_from_device);
+ 
+-	t->slam_calib.cam_count = RIFT_S_CAMERA_COUNT;
+-	for (int i = 0; i < RIFT_S_CAMERA_COUNT; i++) {
++	t->slam_calib.cam_count = rift_s_slam_cam_count();
++	for (int i = 0; i < t->slam_calib.cam_count; i++) {
+ 		enum rift_s_camera_id cam_id = CAM_IDX_TO_ID[i];
+ 		struct rift_s_camera_calibration *cam = &camera_calibration->cameras[cam_id];
+ 
+@@ -213,7 +227,7 @@ rift_s_create_slam_tracker(struct rift_s_tracker *t, struct xrt_frame_context *x
+ 	t_slam_fill_default_config(&config);
+ 
+ 	/* No need to refcount these parameters */
+-	config.cam_count = RIFT_S_CAMERA_COUNT;
++	config.cam_count = rift_s_slam_cam_count();
+ 	config.slam_calib = &t->slam_calib;
+ 	if (debug_get_option_slam_submit_from_start() == NULL) {
+ 		config.submit_from_start = true;
+@@ -691,9 +705,11 @@ rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
+ 	t->last_frame_time = frame_mono_ns;
+ 	os_mutex_unlock(&t->mutex);
+ 
++	// The SLAM system expects exactly the configured cameras, in order
++	const int slam_cams = rift_s_slam_cam_count();
+ 	for (int i = 0; i < RIFT_S_CAMERA_COUNT; i++) {
+-		if (t->slam_sinks.cams[i]) {
+-			frames[i]->timestamp = frame_mono_ns;
++		frames[i]->timestamp = frame_mono_ns;
++		if (i < slam_cams && t->slam_sinks.cams[i]) {
+ 			xrt_sink_push_frame(t->slam_sinks.cams[i], frames[i]);
+ 		}
+ 	}
+-- 
+2.54.0
+

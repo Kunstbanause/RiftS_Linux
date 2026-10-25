@@ -1,0 +1,227 @@
+From 1214106c8c182668034e6e61cb504674761c26b8 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:41:19 +0200
+Subject: [PATCH 5/7] d/rift_s: Keep the constellation tracker able to
+ re-acquire controllers
+
+A live run with fusion enabled showed long (10+ s) losses: once the
+filter was wrong, its pose was used as the constellation prior,
+including the gravity direction that prunes LED correspondences, so the
+tracker never found the controller again and no fix arrived to correct
+the filter.
+
+- While the filter is not optically tracking, return the accelerometer
+  levelled 3DoF orientation + last seen position as the tracker prior.
+  Keep yaw-nudging the 3DoF fusion for that purpose.
+- Apply the accelerometer gravity (tilt) correction whenever the
+  controller is quasi-static, not only while holding.
+- Refuse to (re)initialise from optical poses whose tilt disagrees with
+  the accelerometer by more than 15 degrees (typical of wrong LED
+  matches), giving up on the check after 3 s of failures in case the
+  tracking world itself isn't gravity aligned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_controller.c    | 15 +++--
+ .../rift_s/rift_s_controller_fusion.cpp       | 66 +++++++++++++++++--
+ .../drivers/rift_s/rift_s_controller_fusion.h |  4 ++
+ 3 files changed, 76 insertions(+), 9 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index 2b95203..6452fdd 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -705,6 +705,14 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
+ 	// Prefer the 6DoF fusion: IMU pose predicted / interpolated to the requested time
+ 	bool have_fusion_pose = ctrl->use_fusion && ctrl->ctrl_fusion != NULL &&
+ 	                        rift_s_ctrl_fusion_get_relation(ctrl->ctrl_fusion, at_timestamp_ns, rel);
++
++	/* The constellation tracker uses this pose as the prior for LED matching, including its gravity
++	 * direction. While the filter isn't optically tracking, give it the accelerometer-levelled 3DoF
++	 * orientation and last seen position instead, so it can always re-acquire the controller. */
++	if (have_fusion_pose && name == XRT_INPUT_GENERIC_TRACKER_POSE &&
++	    (rel->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0) {
++		have_fusion_pose = false;
++	}
+ 	if (!have_fusion_pose) {
+ 		rift_s_controller_get_fusion_pose(ctrl, name, at_timestamp_ns, rel);
+ 		if (ctrl->last_tracked_pose_ts != 0) {
+@@ -819,12 +827,10 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
+ 	ctrl->last_tracked_pose_ts = frame_mono_ns;
+ 	ctrl->last_tracked_pose = *pose;
+ 
+-	bool fusion_active = false;
+ 	if (ctrl->ctrl_fusion != NULL) {
+ 		enum rift_s_ctrl_fusion_pose_result res =
+ 		    rift_s_ctrl_fusion_pose(ctrl->ctrl_fusion, frame_mono_ns, pose);
+ 		rift_s_ctrl_fusion_get_stats(ctrl->ctrl_fusion, &ctrl->fusion_stats);
+-		fusion_active = ctrl->use_fusion && rift_s_ctrl_fusion_is_initialised(ctrl->ctrl_fusion);
+ 
+ 		if (ctrl->record_optical != NULL) {
+ 			fprintf(ctrl->record_optical, "%" PRId64 ",%" PRId64 ",%f,%f,%f,%f,%f,%f,%f,%d\n", frame_mono_ns,
+@@ -834,8 +840,9 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
+ 		}
+ 	}
+ 
+-	// The 3DoF yaw nudging is only needed when the fusion filter isn't driving the pose
+-	if (ctrl->update_yaw_from_optical && !fusion_active) {
++	// Keep the 3DoF orientation's yaw aligned with the optical tracking: it is the
++	// fallback pose, and the constellation tracker's prior while fusion isn't tracking
++	if (ctrl->update_yaw_from_optical) {
+ 		// Apply 5% of observed orientation yaw to 3dof fusion
+ 		// FIXME: Do better
+ 		struct xrt_quat delta;
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+index 195b6f3..a0d9af0 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+@@ -59,6 +59,12 @@ constexpr double MAX_GYRO_DT = 0.05;
+ //! Number of recent rejected fixes considered when deciding on a reset
+ constexpr size_t REJECT_WINDOW = 8;
+ 
++//! Tilt check of optical poses against the accelerometer
++constexpr int64_t TILT_CHECK_WINDOW_NS = 15 * 1000 * 1000;
++constexpr double TILT_CHECK_MAX_ACCEL_DEV = 1.0;
++constexpr double TILT_CHECK_MAX_GYRO = 1.0;
++constexpr double TILT_CHECK_GIVE_UP_S = 3.0;
++
+ //! Bias clamps, as in the OpenHMD filter
+ constexpr double MAX_GYRO_BIAS = 0.3;
+ constexpr double MAX_ACCEL_BIAS = 1.0;
+@@ -190,6 +196,10 @@ public:
+ 		}
+ 
+ 		if (!initialised_) {
++			if (!tilt_consistent(frame_ts, z_q)) {
++				stats_.poses_rejected++;
++				return RIFT_S_CTRL_FUSION_POSE_REJECTED;
++			}
+ 			reinit(frame_ts, z_p, z_q, false);
+ 			return RIFT_S_CTRL_FUSION_POSE_RESET;
+ 		}
+@@ -232,7 +242,7 @@ public:
+ 				rejected_.pop_front();
+ 			}
+ 			const RejectedFix *reset_to = find_reset_target(frame_ts);
+-			if (reset_to != nullptr) {
++			if (reset_to != nullptr && tilt_consistent(reset_to->ts, reset_to->z_q)) {
+ 				const RejectedFix target = *reset_to;
+ 				reinit(target.ts, target.z_p, target.z_q, true);
+ 				return RIFT_S_CTRL_FUSION_POSE_RESET;
+@@ -321,6 +331,7 @@ public:
+ 		initialised_ = false;
+ 		rejected_.clear();
+ 		last_fix_ts_ = 0;
++		tilt_fail_since_ = 0;
+ 		imu_buf_.clear();
+ 		history_.clear();
+ 	}
+@@ -346,12 +357,55 @@ private:
+ 	bool initialised_{false};
+ 	//! Offsets of the optical fixes rejected since the last accepted one
+ 	std::deque<RejectedFix> rejected_;
++	//! First fix time of the current run of tilt-check failures, 0 if none
++	int64_t tilt_fail_since_{0};
+ 	int gravity_meas_counter_{0};
+ 	int64_t last_fix_ts_{0};
+ 
+ 	std::deque<ImuSample> imu_buf_;
+ 	std::deque<HistoryEntry> history_;
+ 
++	/*!
++	 * Check an optical orientation against the accelerometer's gravity
++	 * direction around @p ts. Wrong LED correspondences are usually tens of
++	 * degrees off in tilt. Returns true when the IMU data can't tell (moving),
++	 * and also once every fix has failed for a while, in case the tracking
++	 * world itself isn't gravity aligned (e.g. before head tracking settles).
++	 */
++	bool
++	tilt_consistent(int64_t ts, const Quaterniond &z_q)
++	{
++		Vector3d sum = Vector3d::Zero();
++		double max_gyro = 0;
++		int n = 0;
++		for (const ImuSample &s : imu_buf_) {
++			if (s.ts < ts - TILT_CHECK_WINDOW_NS || s.ts > ts + TILT_CHECK_WINDOW_NS) {
++				continue;
++			}
++			sum += s.accel;
++			max_gyro = std::max(max_gyro, s.gyro.norm());
++			n++;
++		}
++		if (n < 5) {
++			return true;
++		}
++		const Vector3d a = sum / n;
++		if (std::fabs(a.norm() - GRAVITY) > TILT_CHECK_MAX_ACCEL_DEV || max_gyro > TILT_CHECK_MAX_GYRO) {
++			return true;
++		}
++		const Vector3d up = (z_q.normalized() * a).normalized();
++		const bool ok = std::acos(std::clamp(up.y(), -1.0, 1.0)) <= params_.tilt_check_max;
++		if (ok) {
++			tilt_fail_since_ = 0;
++			return true;
++		}
++		stats_.tilt_rejections++;
++		if (tilt_fail_since_ == 0) {
++			tilt_fail_since_ = ts;
++		}
++		return ns_to_s(ts - tilt_fail_since_) > TILT_CHECK_GIVE_UP_S;
++	}
++
+ 	/*!
+ 	 * Decide whether rejections mean the filter (not the optical tracker) is
+ 	 * wrong: enough recently rejected fixes must agree with each other on a
+@@ -586,14 +640,15 @@ private:
+ 	}
+ 
+ 	/*!
+-	 * While the position is held (controller unseen), use the accelerometer as a
+-	 * gravity direction measurement when the controller is static, so that pitch
+-	 * and roll don't drift during long occlusions.
++	 * Use the accelerometer as a gravity direction measurement whenever the
++	 * controller is quasi-static, so that pitch and roll stay right even when
++	 * optical fixes are scarce. The constellation tracker relies on the prior
++	 * gravity direction to prune LED correspondences.
+ 	 */
+ 	void
+ 	maybe_correct_gravity(State &x, Mat15 &P, const ImuSample &s)
+ 	{
+-		if (!holding(s.ts) || ++gravity_meas_counter_ < GRAVITY_MEAS_EVERY_N) {
++		if (++gravity_meas_counter_ < GRAVITY_MEAS_EVERY_N) {
+ 			return;
+ 		}
+ 		gravity_meas_counter_ = 0;
+@@ -655,6 +710,7 @@ rift_s_ctrl_fusion_default_params(struct rift_s_ctrl_fusion_params *out)
+ 	out->reset_consistency_pos = 0.03f;
+ 	out->reset_consistency_rot = 0.15f;
+ 	out->reset_force_after = 1.5f;
++	out->tilt_check_max = 0.26f;
+ 
+ 	out->coast_start = 0.2f;
+ 	out->coast_vel_tau = 0.2f;
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+index ca8d115..7118add 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+@@ -58,6 +58,8 @@ struct rift_s_ctrl_fusion_params
+ 	float reset_consistency_rot;
+ 	//! Reset regardless of consistency once no fix was accepted for this long (s)
+ 	float reset_force_after;
++	//! Max tilt difference between an optical pose and the accelerometer for (re)initialisation (rad)
++	float tilt_check_max;
+ 
+ 	//! Time without an accepted fix after which velocity starts decaying (s)
+ 	float coast_start;
+@@ -97,6 +99,8 @@ struct rift_s_ctrl_fusion_stats
+ 	uint64_t poses_rejected;
+ 	uint64_t resets;
+ 	uint64_t poses_ignored;
++	//! Optical poses refused for (re)initialisation by the accelerometer tilt check
++	uint64_t tilt_rejections;
+ 	//! Squared Mahalanobis distance of the last optical innovation
+ 	float last_chi2;
+ 	//! Position innovation of the last optical fix (m)
+-- 
+2.54.0
+

@@ -1,0 +1,20 @@
+#!/bin/bash
+# Rift S on Linux: status window + first-time setup.
+#   ./rift-s-linux               window (Setup tab opens by itself until everything is installed)
+#   ./rift-s-linux --once        text status report
+#   ./rift-s-linux setup [install [step ...] | uninstall]   setup in the terminal
+# The window runs in its own Python venv with pip's PySide6 (bundled Qt), so it never installs or
+# upgrades your system's Qt (doing that once pulled a Qt upgrade ahead of Plasma and broke KDE).
+set -e
+HERE="$(dirname "$(readlink -f "$0")")"
+APP="$HERE/app/vrstatus.py"
+case "$1" in
+	setup|--once) exec python3 "$APP" "$@" ;;
+esac
+VENV="${RIFTS_HOME:-$HOME}/.local/opt/rift-s-linux/venv"
+if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c "import PySide6" 2>/dev/null; then
+	echo "First start: creating $VENV with PySide6 from pip (~250 MB, no root, nothing system-wide)..."
+	python3 -m venv "$VENV"
+	"$VENV/bin/pip" install -q --disable-pip-version-check PySide6-Essentials
+fi
+exec "$VENV/bin/python" "$APP" "$@"

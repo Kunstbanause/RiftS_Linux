@@ -1,0 +1,297 @@
+From a8af9e469bdfe0935302aa15b72547d4cc611499 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:31:55 +0200
+Subject: [PATCH] d/rift_s, t/constellation: Don't keep wrong poses alive after
+ the fusion rejects them
+
+In the Alyx session the left controller was lost for 1.5-3 s three times
+in 5 minutes: the tracker kept delivering the same wrong pose (~48 deg /
+20 cm off, consistent). The fusion refused it, but the tracker never
+learned that: submit_device_pose() had already labelled the blobs with
+the wrong LED IDs and stored it as the last seen pose, so the labelled
+blob recovery and the last seen pose rebuilt it frame after frame, while
+the prior refinement was off because the fusion was holding.
+
+- push_observed_pose_info returns whether the device accepted the pose.
+  On a rejection the tracker clears the device's blob labels in all views
+  of the sample (and the newest observations), keeps the previous last
+  seen pose, and lets the remaining strategies / the full search try.
+- The last seen pose is only tried while the device's prior isn't
+  tracked: a tracked prior is better than an older pose (in the watch
+  gesture last_seen gave 12 % of the left controller's fixes, 30 % good).
+- Rift S controller: rejected fixes no longer update the fallback prior
+  (last optical position, 3DoF yaw correction), which steered the
+  tracker's search towards the wrong match. The status file's optical age
+  is now the age of the last accepted fix.
+
+Both tracker changes follow CONSTELLATION_PRIOR_REFINE (0 = original).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_controller.c    | 34 +++++---
+ .../tracking/t_constellation_tracking.h       |  8 +-
+ .../constellation/t_constellation_tracking.c  | 85 ++++++++++++++-----
+ 3 files changed, 92 insertions(+), 35 deletions(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index a4412a0..6a7f0fe 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -893,7 +893,8 @@ rift_s_controller_get_led_model(struct xrt_device *xdev, struct t_constellation_
+ 	return true;
+ }
+ 
+-static void
++//! @return false if the fusion rejected the fix (a wrong LED match), so the tracker drops it
++static bool
+ rift_s_controller_push_observed_pose_info(struct xrt_device *xdev,
+                                           timepoint_ns frame_mono_ns,
+                                           const struct xrt_pose *pose,
+@@ -910,17 +911,7 @@ rift_s_controller_push_observed_pose_info(struct xrt_device *xdev,
+ 
+ 	os_mutex_lock(&ctrl->mutex);
+ 
+-	// Only keep strictly newer samples, so the velocity fit never sees time going backwards.
+-	if (ctrl->pos_history_count == 0 || frame_mono_ns > ctrl->last_tracked_pose_ts) {
+-		uint32_t idx = ctrl->pos_history_count % RIFT_S_CONTROLLER_POS_HISTORY;
+-		ctrl->pos_history[idx].ts = frame_mono_ns;
+-		ctrl->pos_history[idx].pos = pose->position;
+-		ctrl->pos_history_count++;
+-	}
+-
+-	ctrl->last_tracked_pose_ts = frame_mono_ns;
+-	ctrl->last_tracked_pose = *pose;
+-
++	bool accepted = true;
+ 	if (ctrl->ctrl_fusion != NULL) {
+ 		// The filter's own pose at the exposure, before this fix is applied
+ 		struct xrt_space_relation prior = XRT_SPACE_RELATION_ZERO;
+@@ -931,6 +922,7 @@ rift_s_controller_push_observed_pose_info(struct xrt_device *xdev,
+ 		enum rift_s_ctrl_fusion_pose_result res =
+ 		    rift_s_ctrl_fusion_pose(ctrl->ctrl_fusion, frame_mono_ns, pose);
+ 		rift_s_ctrl_fusion_get_stats(ctrl->ctrl_fusion, &ctrl->fusion_stats);
++		accepted = !ctrl->use_fusion || res != RIFT_S_CTRL_FUSION_POSE_REJECTED;
+ 
+ 		if (ctrl->record_optical != NULL) {
+ 			const struct t_constellation_pose_info no_info = {.view_id = -1};
+@@ -952,6 +944,23 @@ rift_s_controller_push_observed_pose_info(struct xrt_device *xdev,
+ 		}
+ 	}
+ 
++	if (!accepted) {
++		// A rejected fix must not steer the fallback prior (last position, 3DoF yaw) towards a wrong match
++		os_mutex_unlock(&ctrl->mutex);
++		return false;
++	}
++
++	// Only keep strictly newer samples, so the velocity fit never sees time going backwards.
++	if (ctrl->pos_history_count == 0 || frame_mono_ns > ctrl->last_tracked_pose_ts) {
++		uint32_t idx = ctrl->pos_history_count % RIFT_S_CONTROLLER_POS_HISTORY;
++		ctrl->pos_history[idx].ts = frame_mono_ns;
++		ctrl->pos_history[idx].pos = pose->position;
++		ctrl->pos_history_count++;
++	}
++
++	ctrl->last_tracked_pose_ts = frame_mono_ns;
++	ctrl->last_tracked_pose = *pose;
++
+ 	// Keep the 3DoF orientation's yaw aligned with the optical tracking: it is the
+ 	// fallback pose, and the constellation tracker's prior while fusion isn't tracking
+ 	if (ctrl->update_yaw_from_optical) {
+@@ -994,6 +1003,7 @@ rift_s_controller_push_observed_pose_info(struct xrt_device *xdev,
+ 	// Update pose position for the debug UI
+ 	ctrl->pose.position = pose->position;
+ 	os_mutex_unlock(&ctrl->mutex);
++	return true;
+ }
+ 
+ static FILE *
+diff --git a/src/xrt/include/tracking/t_constellation_tracking.h b/src/xrt/include/tracking/t_constellation_tracking.h
+index fb1b5b6..cf09dd9 100644
+--- a/src/xrt/include/tracking/t_constellation_tracking.h
++++ b/src/xrt/include/tracking/t_constellation_tracking.h
+@@ -101,8 +101,12 @@ struct t_constellation_tracked_device_callbacks
+ 	bool (*get_led_model)(struct xrt_device *xdev, struct t_constellation_led_model *led_model);
+ 	void (*notify_frame_received)(struct xrt_device *xdev, uint64_t frame_mono_ns, uint64_t frame_sequence);
+ 	void (*push_observed_pose)(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose);
+-	//! Optional, used instead of push_observed_pose when set
+-	void (*push_observed_pose_info)(struct xrt_device *xdev,
++	/*!
++	 * Optional, used instead of push_observed_pose when set. Returns false if the device rejected the
++	 * pose (e.g. its fusion considers it a wrong LED match): the tracker then drops the blob labels and
++	 * doesn't keep it as the last seen pose, so it doesn't keep finding the same wrong pose.
++	 */
++	bool (*push_observed_pose_info)(struct xrt_device *xdev,
+ 	                                timepoint_ns frame_mono_ns,
+ 	                                const struct xrt_pose *pose,
+ 	                                const struct t_constellation_pose_info *info);
+diff --git a/src/xrt/tracking/constellation/t_constellation_tracking.c b/src/xrt/tracking/constellation/t_constellation_tracking.c
+index eb9df4c..10be615 100644
+--- a/src/xrt/tracking/constellation/t_constellation_tracking.c
++++ b/src/xrt/tracking/constellation/t_constellation_tracking.c
+@@ -208,21 +208,24 @@ constellation_tracked_device_connection_notify_frame(struct t_constellation_trac
+ 	os_mutex_unlock(&ctdc->lock);
+ }
+ 
+-static void
++//! @return false if the device rejected the pose
++static bool
+ constellation_tracked_device_connection_notify_pose(struct t_constellation_tracked_device_connection *ctdc,
+                                                     timepoint_ns frame_mono_ns,
+                                                     const struct xrt_pose *pose,
+                                                     const struct t_constellation_pose_info *info)
+ {
++	bool accepted = true;
+ 	os_mutex_lock(&ctdc->lock);
+ 	if (!ctdc->disconnected) {
+ 		if (ctdc->cb->push_observed_pose_info) {
+-			ctdc->cb->push_observed_pose_info(ctdc->xdev, frame_mono_ns, pose, info);
++			accepted = ctdc->cb->push_observed_pose_info(ctdc->xdev, frame_mono_ns, pose, info);
+ 		} else if (ctdc->cb->push_observed_pose) {
+ 			ctdc->cb->push_observed_pose(ctdc->xdev, frame_mono_ns, pose);
+ 		}
+ 	}
+ 	os_mutex_unlock(&ctdc->lock);
++	return accepted;
+ }
+ 
+ static void
+@@ -343,7 +346,7 @@ mark_matching_blobs(struct t_constellation_tracker *ct,
+ 	}
+ }
+ 
+-//! @return false if the pose was dropped (unrefined prior / last seen pose)
++//! @return false if the pose was dropped (unrefined prior / last seen pose) or rejected by the device
+ static bool
+ submit_device_pose(struct t_constellation_tracker *ct,
+                    struct tracking_sample_device_state *dev_state,
+@@ -458,14 +461,10 @@ submit_device_pose(struct t_constellation_tracker *ct,
+ 		math_vec3_accum(&pose_delta.position, &dev_state->final_pose.position);
+ 	}
+ 
++	bool rejected = false;
+ 	os_mutex_lock(&ct->tracked_device_lock);
++	// last_seen_pose only advances with accepted poses, so a rejected one lets other views / searches retry
+ 	if (device->have_last_seen_pose == false || sample->timestamp > device->last_seen_pose_ts) {
+-		device->have_last_seen_pose = true;
+-		device->last_seen_pose_ts = sample->timestamp;
+-		device->last_seen_pose = dev_state->final_pose;
+-		device->last_matched_blobs = score->matched_blobs;
+-		device->last_matched_cam = view_id;
+-		device->last_matched_cam_pose = *P_cam_obj;
+ 
+ 		/* Submit this pose observation to the fusion / real device. Flip back to OpenXR coords first, then
+ 		 * apply model pose */
+@@ -501,8 +500,19 @@ submit_device_pose(struct t_constellation_tracker *ct,
+ 		                              : 0.0f,
+ 		    .found_ns = (timepoint_ns)os_monotonic_get_ns(),
+ 		};
+-		constellation_tracked_device_connection_notify_pose(device->connection, sample->timestamp,
+-		                                                    &P_xrworld_device, &info);
++		bool accepted = constellation_tracked_device_connection_notify_pose(device->connection,
++		                                                                    sample->timestamp,
++		                                                                    &P_xrworld_device, &info);
++		if (accepted || !ct->prior_refine) {
++			device->have_last_seen_pose = true;
++			device->last_seen_pose_ts = sample->timestamp;
++			device->last_seen_pose = dev_state->final_pose;
++			device->last_matched_blobs = score->matched_blobs;
++			device->last_matched_cam = view_id;
++			device->last_matched_cam_pose = *P_cam_obj;
++		} else {
++			rejected = true;
++		}
+ 
+ 		// update the controller masks for this controller
+ 		if (ct->controller_masks_sink) {
+@@ -543,6 +553,31 @@ submit_device_pose(struct t_constellation_tracker *ct,
+ 		}
+ 	}
+ 	os_mutex_unlock(&ct->tracked_device_lock);
++
++	if (rejected) {
++		/* The device rejected this pose: drop the labels it put on the blobs (in every view of the
++		 * sample, and in the newest observations), so the labelled-blob recovery doesn't rebuild the
++		 * same wrong pose next frame, and let the remaining strategies (and the full search) try */
++		uint32_t id = device->led_model.id;
++		for (int v = 0; v < sample->n_views; v++) {
++			struct tracking_sample_frame *sv = sample->views + v;
++			if (sv->bwobs == NULL) {
++				continue;
++			}
++			for (int b = 0; b < sv->bwobs->num_blobs; b++) {
++				struct blob *blob = sv->bwobs->blobs + b;
++				if (LED_OBJECT_ID(blob->led_id) == id) {
++					blob->led_id = LED_INVALID_ID;
++				}
++			}
++			struct constellation_tracker_camera_state *vcam = ct->cam + v;
++			os_mutex_lock(&vcam->bw_lock);
++			blobwatch_update_labels(vcam->bw, sv->bwobs, id);
++			os_mutex_unlock(&vcam->bw_lock);
++		}
++		dev_state->found_device_pose = false;
++		return false;
++	}
+ 	return true;
+ }
+ 
+@@ -712,9 +747,11 @@ device_try_prior_refine(struct t_constellation_tracker *ct,
+ 		                                      bwobs->blobs, bwobs->num_blobs, leds_model, &cam->camera_model,
+ 		                                      NULL);
+ 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
+-			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
+-			                   T_CONSTELLATION_POSE_FROM_PRIOR_REFINED);
+-			return true;
++			if (submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
++			                       T_CONSTELLATION_POSE_FROM_PRIOR_REFINED)) {
++				return true;
++			}
++			continue;
+ 		}
+ 		CT_DEBUG(ct, "Camera %d prior refinement for device %d: %d pairs, %d inliers, match flags 0x%x",
+ 		         view_id, leds_model->id, pairs, num_inliers, dev_state->score.match_flags);
+@@ -787,9 +824,11 @@ device_try_recover_pose(struct t_constellation_tracker *ct,
+ 		if (POSE_HAS_FLAGS(&dev_state->score, POSE_MATCH_GOOD)) {
+ 			CT_DEBUG(ct, "Camera %d RANSAC-PnP recovered pose for device %d from %u blobs", view_id,
+ 			         leds_model->id, num_blobs);
+-			submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
+-			                   T_CONSTELLATION_POSE_FROM_LABELLED_BLOBS);
+-			return true;
++			if (submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
++			                       T_CONSTELLATION_POSE_FROM_LABELLED_BLOBS)) {
++				return true;
++			}
++			continue;
+ 		}
+ 		CT_DEBUG(ct,
+ 		         "Camera %d device %d had %d prior blobs, but failed match with flags 0x%x. "
+@@ -972,7 +1011,9 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
+ 			         device->led_model.id, dev_state->found_pose_view_id);
+ 			continue;
+ 		}
+-		if (dev_state->have_last_seen_pose &&
++		/* A tracked prior is better than an older pose; only fall back to the last seen pose while the
++		 * device's fusion has lost it */
++		if (dev_state->have_last_seen_pose && (!ct->prior_refine || !dev_state->prior_tracked) &&
+ 		    device_try_global_pose(ct, dev_state, sample, &dev_state->last_seen_pose,
+ 		                           T_CONSTELLATION_POSE_FROM_LAST_SEEN)) {
+ 			CT_DEBUG(ct, "Found fast match search for device %d in view %d from last_seen pose",
+@@ -1129,9 +1170,11 @@ constellation_tracker_process_frame_long(struct t_constellation_tracker *ct,
+ 				        &view->cam_gravity_vector, dev_state->gravity_error_rad, &dev_state->score)) {
+ 					CT_DEBUG(ct, "Found a pose on cam %u device %d long search pass %d", view_id,
+ 					         device->led_model.id, pass);
+-					submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
+-					                   pass == 0 ? T_CONSTELLATION_POSE_FROM_SHALLOW_SEARCH
+-					                             : T_CONSTELLATION_POSE_FROM_DEEP_SEARCH);
++					if (!submit_device_pose(ct, dev_state, sample, view_id, &P_cam_obj,
++					                        pass == 0 ? T_CONSTELLATION_POSE_FROM_SHALLOW_SEARCH
++					                                  : T_CONSTELLATION_POSE_FROM_DEEP_SEARCH)) {
++						continue; // rejected by the device, try the deep search
++					}
+ 					dev_found[d] = true;
+ 					break;
+ 				}
+-- 
+2.54.0
+

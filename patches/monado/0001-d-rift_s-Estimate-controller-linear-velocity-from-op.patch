@@ -1,0 +1,172 @@
+From 3befc64633217475f58a8723a3c2caa836c2ebcb Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:15:08 +0200
+Subject: [PATCH 1/7] d/rift_s: Estimate controller linear velocity from
+ optical fixes
+
+The controller pose always reported zero linear velocity with the
+VALID bit set, which breaks velocity-based gestures (Alyx gravity
+glove flick, throwing). Fit a least-squares line over the last 80 ms
+of optical positions instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/rift_s/rift_s_controller.c | 92 +++++++++++++++++++++-
+ src/xrt/drivers/rift_s/rift_s_controller.h | 10 +++
+ 2 files changed, 101 insertions(+), 1 deletion(-)
+
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index bb8949d..3367581 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -28,6 +28,7 @@
+ #include "os/os_hid.h"
+ 
+ #include "util/u_device.h"
++#include "util/u_time.h"
+ #include "util/u_trace_marker.h"
+ #include "util/u_var.h"
+ 
+@@ -512,6 +513,86 @@ rift_s_controller_update_inputs(struct xrt_device *xdev)
+ 	return XRT_SUCCESS;
+ }
+ 
++//! Optical position samples newer than this (relative to the newest) are fitted for velocity
++#define VELOCITY_WINDOW_NS (80 * U_TIME_1MS_IN_NS)
++//! Minimum time spanned by the fitted samples, shorter spans are too noisy
++#define VELOCITY_MIN_SPAN_NS (15 * U_TIME_1MS_IN_NS)
++//! Report zero velocity if the last optical fix is older than this
++#define VELOCITY_STALE_NS (100 * U_TIME_1MS_IN_NS)
++//! Clamp for velocity spikes caused by tracking re-acquisition jumps
++#define VELOCITY_MAX_M_S 15.0f
++
++/*!
++ * Estimate the world-space linear velocity of the IMU from recent optical fixes,
++ * using a least-squares line fit of position over time. Must be called with the
++ * controller mutex held.
++ */
++static struct xrt_vec3
++rift_s_controller_estimate_linear_velocity(struct rift_s_controller *ctrl, timepoint_ns now_ns)
++{
++	struct xrt_vec3 zero = XRT_VEC3_ZERO;
++	uint32_t count = ctrl->pos_history_count < RIFT_S_CONTROLLER_POS_HISTORY ? ctrl->pos_history_count
++	                                                                    : RIFT_S_CONTROLLER_POS_HISTORY;
++	if (count < 2) {
++		return zero;
++	}
++
++	uint32_t newest = (ctrl->pos_history_count - 1) % RIFT_S_CONTROLLER_POS_HISTORY;
++	timepoint_ns newest_ts = ctrl->pos_history[newest].ts;
++	if (now_ns - newest_ts > VELOCITY_STALE_NS) {
++		return zero;
++	}
++
++	// Collect samples inside the window, with times relative to the newest sample.
++	double t[RIFT_S_CONTROLLER_POS_HISTORY];
++	struct xrt_vec3 p[RIFT_S_CONTROLLER_POS_HISTORY];
++	uint32_t n = 0;
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t idx = (ctrl->pos_history_count - 1 - i) % RIFT_S_CONTROLLER_POS_HISTORY;
++		time_duration_ns age = newest_ts - ctrl->pos_history[idx].ts;
++		if (age > VELOCITY_WINDOW_NS) {
++			break;
++		}
++		t[n] = -(double)age / U_TIME_1S_IN_NS;
++		p[n] = ctrl->pos_history[idx].pos;
++		n++;
++	}
++	if (n < 2 || -t[n - 1] * U_TIME_1S_IN_NS < VELOCITY_MIN_SPAN_NS) {
++		return zero;
++	}
++
++	double t_mean = 0, px = 0, py = 0, pz = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		t_mean += t[i];
++		px += p[i].x;
++		py += p[i].y;
++		pz += p[i].z;
++	}
++	t_mean /= n;
++	px /= n;
++	py /= n;
++	pz /= n;
++
++	double stt = 0, stx = 0, sty = 0, stz = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		double dt = t[i] - t_mean;
++		stt += dt * dt;
++		stx += dt * (p[i].x - px);
++		sty += dt * (p[i].y - py);
++		stz += dt * (p[i].z - pz);
++	}
++	if (stt <= 0) {
++		return zero;
++	}
++
++	struct xrt_vec3 v = {(float)(stx / stt), (float)(sty / stt), (float)(stz / stt)};
++	float speed = m_vec3_len(v);
++	if (speed > VELOCITY_MAX_M_S) {
++		v = m_vec3_mul_scalar(v, VELOCITY_MAX_M_S / speed);
++	}
++	return v;
++}
++
+ static void
+ rift_s_controller_get_fusion_pose(struct rift_s_controller *ctrl,
+                                   enum xrt_input_name name,
+@@ -566,7 +647,8 @@ rift_s_controller_get_tracked_pose(struct xrt_device *xdev,
+ 	rift_s_controller_get_fusion_pose(ctrl, name, at_timestamp_ns, rel);
+ 	if (ctrl->last_tracked_pose_ts != 0) {
+ 		rel->pose.position = ctrl->last_tracked_pose.position;
+-		rel->relation_flags |= (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
++		rel->linear_velocity = rift_s_controller_estimate_linear_velocity(ctrl, os_monotonic_get_ns());
++		rel->relation_flags |=(enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
+ 		                                                       XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+ 	}
+ 	os_mutex_unlock(&ctrl->mutex);
+@@ -651,6 +733,14 @@ rift_s_controller_push_observed_pose(struct xrt_device *xdev, timepoint_ns frame
+ 	struct rift_s_controller *ctrl = (struct rift_s_controller *)(xdev);
+ 	os_mutex_lock(&ctrl->mutex);
+ 
++	// Only keep strictly newer samples, so the velocity fit never sees time going backwards.
++	if (ctrl->pos_history_count == 0 || frame_mono_ns > ctrl->last_tracked_pose_ts) {
++		uint32_t idx = ctrl->pos_history_count % RIFT_S_CONTROLLER_POS_HISTORY;
++		ctrl->pos_history[idx].ts = frame_mono_ns;
++		ctrl->pos_history[idx].pos = pose->position;
++		ctrl->pos_history_count++;
++	}
++
+ 	ctrl->last_tracked_pose_ts = frame_mono_ns;
+ 	ctrl->last_tracked_pose = *pose;
+ 
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.h b/src/xrt/drivers/rift_s/rift_s_controller.h
+index e7e5665..c075704 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller.h
+@@ -24,6 +24,8 @@
+ #include "rift_s.h"
+ 
+ #define MAX_LOG_SIZE 1024
++//! Number of optical position samples kept for linear velocity estimation
++#define RIFT_S_CONTROLLER_POS_HISTORY 8
+ 
+ typedef struct
+ {
+@@ -57,6 +59,14 @@ struct rift_s_controller
+ 	timepoint_ns last_tracked_pose_ts;
+ 	//! Last tracked pose from optical controller tracking
+ 	struct xrt_pose last_tracked_pose;
++	//! Recent optically tracked IMU positions, used to estimate linear velocity
++	struct
++	{
++		timepoint_ns ts;
++		struct xrt_vec3 pos;
++	} pos_history[RIFT_S_CONTROLLER_POS_HISTORY];
++	//! Total number of samples pushed into @ref pos_history (write index = count % size)
++	uint32_t pos_history_count;
+ 	//! debug boolean - enable yaw updates
+ 	bool update_yaw_from_optical;
+ 
+-- 
+2.54.0
+

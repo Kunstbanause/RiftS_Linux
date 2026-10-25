@@ -1,0 +1,62 @@
+From f5e4b67cb1dd865c34c502b7e25d71f051a53534 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 20:07:53 +0200
+Subject: [PATCH] compositor: implement GetPosesForFrame instead of panicking
+
+Half-Life: Alyx calls GetPosesForFrame and xrizer panicked on the
+todo!() (see #448). We don't keep per-frame pose history and the
+prediction IDs we report are always 0, so return the current render
+poses like GetLastPoses. GetLastPosePredictionIDs now writes 0 to its
+out parameters instead of leaving them uninitialised.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/compositor.rs | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/src/compositor.rs b/src/compositor.rs
+index 52f0729..559391b 100644
+--- a/src/compositor.rs
++++ b/src/compositor.rs
+@@ -307,17 +307,33 @@ impl vr::IVRCompositor029_Interface for Compositor {
+     fn GetPosesForFrame(
+         &self,
+         _unPosePredictionID: u32,
+-        _pPoseArray: *mut vr::TrackedDevicePose_t,
+-        _unPoseArrayCount: u32,
++        pPoseArray: *mut vr::TrackedDevicePose_t,
++        unPoseArrayCount: u32,
+     ) -> vr::EVRCompositorError {
+-        todo!()
++        // We don't keep per-frame pose history; the prediction IDs we hand out are always 0,
++        // so answer with the current render poses, the same as GetLastPoses.
++        if pPoseArray.is_null() || unPoseArrayCount == 0 {
++            return vr::EVRCompositorError::None;
++        }
++        let poses =
++            unsafe { std::slice::from_raw_parts_mut(pPoseArray, unPoseArrayCount as usize) };
++        self.input
++            .force(|_| Input::new(self.openxr.clone()))
++            .get_poses(poses, None);
++        vr::EVRCompositorError::None
+     }
+     fn GetLastPosePredictionIDs(
+         &self,
+-        _pRenderPosePredictionID: *mut u32,
+-        _pGamePosePredictionID: *mut u32,
++        pRenderPosePredictionID: *mut u32,
++        pGamePosePredictionID: *mut u32,
+     ) -> vr::EVRCompositorError {
+         crate::warn_unimplemented!("GetLastPosePredictionIDs");
++        if !pRenderPosePredictionID.is_null() {
++            unsafe { pRenderPosePredictionID.write(0) };
++        }
++        if !pGamePosePredictionID.is_null() {
++            unsafe { pGamePosePredictionID.write(0) };
++        }
+         vr::EVRCompositorError::None
+     }
+     fn GetCompositorBenchmarkResults(
+-- 
+2.56.0
+

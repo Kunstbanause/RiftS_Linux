@@ -1,0 +1,591 @@
+From 61d86d08b393b7ec8544bff77aef07fdfb4e33c8 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:36:56 +0200
+Subject: [PATCH 10/11] d/rift_s: Camera images for passthrough, Oculus button
+ long press
+
+Add xrt_device::get_passthrough_frames: the latest camera images, their
+capture time, camera poses relative to the head and Fisheye62
+intrinsics, plus a "forced" flag for passthrough the user switched on.
+Devices without it return XRT_ERROR_NOT_IMPLEMENTED (silently, the
+compositor polls it every frame).
+
+The Rift S hands out the two front cameras (left eye: front left,
+right eye: front right). They are copied out of the camera frame into
+frames of their own, so the v4l2 buffers are not held, and only while
+someone asked for images in the last 500 ms. Images older than 500 ms
+are not handed out (camera stream stopped).
+
+Holding the Oculus button on the right controller for 600 ms toggles
+the forced flag (RIFT_S_PASSTHROUGH_HOLD_MS, 0 disables). Short presses
+still go to apps. The debug UI has a toggle too, and the status file
+gets "passthrough": {forced, streaming, frame_age_ms}.
+
+The HMD now also offers the alpha blend environment mode, after opaque
+so apps keep defaulting to opaque.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/auxiliary/util/u_device.c          |   1 +
+ src/xrt/auxiliary/util/u_device_ni.c       |   8 ++
+ src/xrt/auxiliary/util/u_device_ni.h       |   8 ++
+ src/xrt/drivers/rift_s/rift_s.c            |   8 ++
+ src/xrt/drivers/rift_s/rift_s_controller.c |  32 ++++-
+ src/xrt/drivers/rift_s/rift_s_controller.h |   5 +
+ src/xrt/drivers/rift_s/rift_s_hmd.c        |  16 ++-
+ src/xrt/drivers/rift_s/rift_s_tracker.c    | 153 +++++++++++++++++++++
+ src/xrt/drivers/rift_s/rift_s_tracker.h    |  33 +++++
+ src/xrt/include/xrt/xrt_device.h           |  74 ++++++++++
+ 10 files changed, 335 insertions(+), 3 deletions(-)
+
+diff --git a/src/xrt/auxiliary/util/u_device.c b/src/xrt/auxiliary/util/u_device.c
+index 9da6c51..caa3ece 100644
+--- a/src/xrt/auxiliary/util/u_device.c
++++ b/src/xrt/auxiliary/util/u_device.c
+@@ -639,6 +639,7 @@ u_device_populate_function_pointers(struct xrt_device *xdev,
+ 	xdev->is_form_factor_available = u_device_ni_is_form_factor_available;
+ 	xdev->get_battery_status = u_device_ni_get_battery_status;
+ 	xdev->get_brightness = u_device_ni_get_brightness;
++	xdev->get_passthrough_frames = u_device_ni_get_passthrough_frames;
+ 	xdev->set_brightness = u_device_ni_set_brightness;
+ 	xdev->get_compositor_info = u_device_ni_get_compositor_info;
+ 	xdev->begin_feature = u_device_ni_begin_feature;
+diff --git a/src/xrt/auxiliary/util/u_device_ni.c b/src/xrt/auxiliary/util/u_device_ni.c
+index b9d053b..f78b328 100644
+--- a/src/xrt/auxiliary/util/u_device_ni.c
++++ b/src/xrt/auxiliary/util/u_device_ni.c
+@@ -196,6 +196,14 @@ u_device_ni_get_battery_status(struct xrt_device *xdev, bool *out_present, bool
+ 	return XRT_ERROR_NOT_IMPLEMENTED;
+ }
+ 
++xrt_result_t
++u_device_ni_get_passthrough_frames(struct xrt_device *xdev, bool want_images, struct xrt_passthrough_frames *out_frames)
++{
++	out_frames->forced = false;
++	out_frames->camera_count = 0;
++	return XRT_ERROR_NOT_IMPLEMENTED;
++}
++
+ xrt_result_t
+ u_device_ni_get_brightness(struct xrt_device *xdev, float *out_brightness)
+ {
+diff --git a/src/xrt/auxiliary/util/u_device_ni.h b/src/xrt/auxiliary/util/u_device_ni.h
+index 3ed389e..f64f44b 100644
+--- a/src/xrt/auxiliary/util/u_device_ni.h
++++ b/src/xrt/auxiliary/util/u_device_ni.h
+@@ -219,6 +219,14 @@ u_device_ni_is_form_factor_available(struct xrt_device *xdev, enum xrt_form_fact
+ xrt_result_t
+ u_device_ni_get_battery_status(struct xrt_device *xdev, bool *out_present, bool *out_charging, float *out_charge);
+ 
++/*!
++ * Not implemented function for @ref xrt_device::get_passthrough_frames, silent because compositors poll it.
++ *
++ * @ingroup aux_util
++ */
++xrt_result_t
++u_device_ni_get_passthrough_frames(struct xrt_device *xdev, bool want_images, struct xrt_passthrough_frames *out_frames);
++
+ /*!
+  * Not implemented function for @ref xrt_device::get_brightness.
+  *
+diff --git a/src/xrt/drivers/rift_s/rift_s.c b/src/xrt/drivers/rift_s/rift_s.c
+index 6f52f75..a9c119a 100644
+--- a/src/xrt/drivers/rift_s/rift_s.c
++++ b/src/xrt/drivers/rift_s/rift_s.c
+@@ -636,6 +636,14 @@ write_status_file(struct rift_s_system *sys, timepoint_ns now)
+ 		        p->orientation.z, p->orientation.w);
+ 	}
+ 
++	if (sys->tracker != NULL) {
++		bool forced, streaming;
++		double frame_age_ms;
++		rift_s_tracker_get_passthrough_status(sys->tracker, now, &forced, &streaming, &frame_age_ms);
++		fprintf(f, ", \"passthrough\": {\"forced\": %s, \"streaming\": %s, \"frame_age_ms\": %.1f}",
++		        forced ? "true" : "false", streaming ? "true" : "false", frame_age_ms);
++	}
++
+ 	fprintf(f, ", \"controllers\": {");
+ 
+ 	os_mutex_lock(&sys->dev_mutex);
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.c b/src/xrt/drivers/rift_s/rift_s_controller.c
+index 88871ac..e8eda29 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.c
++++ b/src/xrt/drivers/rift_s/rift_s_controller.c
+@@ -47,6 +47,8 @@
+ DEBUG_GET_ONCE_BOOL_OPTION(rift_s_ctrl_fusion, "RIFT_S_CTRL_FUSION", true)
+ //! Directory to record controller IMU samples and optical poses into, as CSV
+ DEBUG_GET_ONCE_OPTION(rift_s_ctrl_record, "RIFT_S_CTRL_RECORD", NULL)
++//! Holding the Oculus button (right controller) this long toggles passthrough, 0 disables it
++DEBUG_GET_ONCE_NUM_OPTION(rift_s_passthrough_hold_ms, "RIFT_S_PASSTHROUGH_HOLD_MS", 600)
+ 
+ //! Approximate controller IMU sample rate, sizes the clock estimator window (1 s)
+ #define CTRL_IMU_CLOCK_WINDOW 500
+@@ -273,6 +275,32 @@ handle_imu_update(struct rift_s_controller *ctrl,
+ #endif
+ }
+ 
++//! Long press on the Oculus button toggles passthrough. Short presses still go to apps as usual.
++static void
++check_passthrough_long_press(struct rift_s_controller *ctrl, timepoint_ns local_ts)
++{
++	int64_t hold_ms = debug_get_num_option_rift_s_passthrough_hold_ms();
++	if (ctrl->device_type != RIFT_S_DEVICE_RIGHT_CONTROLLER || hold_ms <= 0) {
++		return;
++	}
++
++	if (!(ctrl->buttons & RIFT_S_BUTTON_MENU_OCULUS)) {
++		ctrl->oculus_press_start_ns = 0;
++		return;
++	}
++
++	if (ctrl->oculus_press_start_ns == 0) {
++		ctrl->oculus_press_start_ns = local_ts;
++		ctrl->oculus_long_press_handled = false;
++		return;
++	}
++
++	if (!ctrl->oculus_long_press_handled && (local_ts - ctrl->oculus_press_start_ns) >= hold_ms * U_TIME_1MS_IN_NS) {
++		ctrl->oculus_long_press_handled = true;
++		rift_s_tracker_toggle_passthrough(rift_s_system_get_tracker(ctrl->sys));
++	}
++}
++
+ bool
+ rift_s_controller_handle_report(struct rift_s_controller *ctrl,
+                                 timepoint_ns local_ts,
+@@ -353,8 +381,10 @@ rift_s_controller_handle_report(struct rift_s_controller *ctrl,
+ 		}
+ 	}
+ 
+-	if (saw_controls_update)
++	if (saw_controls_update) {
+ 		ctrl->last_controls_local_time_ns = local_ts;
++		check_passthrough_long_press(ctrl, local_ts);
++	}
+ 
+ 	if (report->extra_bytes_len > 0) {
+ 		if (report->extra_bytes_len > sizeof(ctrl->extra_bytes)) {
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller.h b/src/xrt/drivers/rift_s/rift_s_controller.h
+index ee68a52..69ce13a 100644
+--- a/src/xrt/drivers/rift_s/rift_s_controller.h
++++ b/src/xrt/drivers/rift_s/rift_s_controller.h
+@@ -125,6 +125,11 @@ struct rift_s_controller
+ 	/* Controls / buttons state */
+ 	timepoint_ns last_controls_local_time_ns;
+ 
++	//! When the Oculus button went down (right controller), 0 while released
++	timepoint_ns oculus_press_start_ns;
++	//! The current press already toggled passthrough
++	bool oculus_long_press_handled;
++
+ 	/* 0x8, 0x0c 0x0d or 0xe block */
+ 	uint8_t mask08;
+ 	uint8_t buttons;
+diff --git a/src/xrt/drivers/rift_s/rift_s_hmd.c b/src/xrt/drivers/rift_s/rift_s_hmd.c
+index 235e22a..291d135 100644
+--- a/src/xrt/drivers/rift_s/rift_s_hmd.c
++++ b/src/xrt/drivers/rift_s/rift_s_hmd.c
+@@ -71,6 +71,15 @@ rift_s_get_tracked_pose(struct xrt_device *xdev,
+ 	return XRT_SUCCESS;
+ }
+ 
++static xrt_result_t
++rift_s_get_passthrough_frames(struct xrt_device *xdev, bool want_images, struct xrt_passthrough_frames *out_frames)
++{
++	struct rift_s_hmd *hmd = (struct rift_s_hmd *)(xdev);
++
++	rift_s_tracker_get_passthrough_frames(hmd->tracker, want_images, out_frames);
++	return XRT_SUCCESS;
++}
++
+ void
+ rift_s_hmd_handle_report(struct rift_s_hmd *hmd, timepoint_ns local_ts, rift_s_hmd_report_t *report)
+ {
+@@ -300,6 +309,7 @@ rift_s_hmd_create(struct rift_s_system *sys, const unsigned char *hmd_serial_no,
+ 	hmd->base.update_inputs = u_device_noop_update_inputs;
+ 	hmd->base.get_tracked_pose = rift_s_get_tracked_pose;
+ 	hmd->base.get_view_poses = u_device_get_view_poses;
++	hmd->base.get_passthrough_frames = rift_s_get_passthrough_frames;
+ 	hmd->base.destroy = rift_s_hmd_destroy;
+ 	hmd->base.name = XRT_DEVICE_GENERIC_HMD;
+ 	hmd->base.device_type = XRT_DEVICE_TYPE_HMD;
+@@ -414,9 +424,11 @@ rift_s_hmd_create(struct rift_s_system *sys, const unsigned char *hmd_serial_no,
+ 	hmd->base.compute_distortion = rift_s_compute_distortion;
+ 	u_distortion_mesh_fill_in_compute(&hmd->base);
+ 
+-	/* Set Opaque blend mode */
++	/* Opaque first, so apps keep defaulting to it. Alpha blend shows the camera passthrough behind the app's
++	 * layers (WayVR's "Enable passthrough" uses it). */
+ 	hmd->base.hmd->blend_modes[0] = XRT_BLEND_MODE_OPAQUE;
+-	hmd->base.hmd->blend_mode_count = 1;
++	hmd->base.hmd->blend_modes[1] = XRT_BLEND_MODE_ALPHA_BLEND;
++	hmd->base.hmd->blend_mode_count = 2;
+ 
+ 	// Setup variable tracker: Optional but useful for debugging
+ 	u_var_add_root(hmd, "Oculus Rift S", true);
+diff --git a/src/xrt/drivers/rift_s/rift_s_tracker.c b/src/xrt/drivers/rift_s/rift_s_tracker.c
+index 4e1c8c2..09a78e1 100644
+--- a/src/xrt/drivers/rift_s/rift_s_tracker.c
++++ b/src/xrt/drivers/rift_s/rift_s_tracker.c
+@@ -31,6 +31,7 @@
+ 
+ #include "util/u_debug.h"
+ #include "util/u_device.h"
++#include "util/u_frame.h"
+ #include "util/u_sink.h"
+ #include "util/u_trace_marker.h"
+ #include "util/u_var.h"
+@@ -61,6 +62,11 @@ static const bool hand_supported = true;
+ static const bool hand_supported = false;
+ #endif
+ 
++//! Stop copying camera images for passthrough when nobody asked for them for this long
++#define PASSTHROUGH_REQUEST_TIMEOUT_NS (500 * U_TIME_1MS_IN_NS)
++//! Don't hand out older images (camera stream stopped)
++#define PASSTHROUGH_MAX_FRAME_AGE_NS (500 * U_TIME_1MS_IN_NS)
++
+ //! Specifies whether the user wants to use a SLAM tracker.
+ DEBUG_GET_ONCE_BOOL_OPTION(rift_s_slam, "RIFT_S_SLAM", true)
+ 
+@@ -208,6 +214,29 @@ rift_s_fill_slam_cameras_calibration(struct rift_s_tracker *t, struct rift_s_hmd
+ 	}
+ }
+ 
++//! Front camera poses and intrinsics for passthrough, view i uses SLAM camera i (front left, front right)
++static void
++rift_s_fill_passthrough_calibration(struct rift_s_tracker *t, struct rift_s_hmd_config *hmd_config)
++{
++	for (int i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++		struct rift_s_camera_calibration *cam = &hmd_config->camera_calibration.cameras[CAM_IDX_TO_ID[i]];
++		struct xrt_passthrough_camera *out = &t->passthrough.cams[i];
++
++		// The head pose is the device pose, and the firmware camera frame is already OpenCV style
++		math_pose_from_isometry(&cam->device_from_camera, &out->head_from_camera);
++
++		out->fx = cam->projection.fx;
++		out->fy = cam->projection.fy;
++		out->cx = cam->projection.cx;
++		out->cy = cam->projection.cy;
++		for (int k = 0; k < 6; k++) {
++			out->k[k] = cam->distortion.k[k];
++		}
++		out->p1 = cam->distortion.p1;
++		out->p2 = cam->distortion.p2;
++	}
++}
++
+ static void
+ rift_s_fill_slam_calibration(struct rift_s_tracker *t, struct rift_s_hmd_config *hmd_config)
+ {
+@@ -393,6 +422,9 @@ rift_s_tracker_add_debug_ui(struct rift_s_tracker *t, void *root)
+ 
+ 	u_var_add_gui_header(root, NULL, "Hand Tracking");
+ 	u_var_add_ro_text(root, t->gui.hand_status, "Tracker status");
++
++	u_var_add_gui_header(root, NULL, "Passthrough");
++	u_var_add_bool(root, &t->passthrough.forced, "Forced on (long press Oculus button)");
+ }
+ 
+ /*!
+@@ -426,6 +458,14 @@ rift_s_tracker_create(struct xrt_tracking_origin *origin,
+ 		return NULL;
+ 	}
+ 
++	ret = os_mutex_init(&t->passthrough.mutex);
++	if (ret != 0) {
++		RIFT_S_ERROR("Failed to init passthrough mutex!");
++		rift_s_tracker_destroy(t);
++		return NULL;
++	}
++	rift_s_fill_passthrough_calibration(t, hmd_config);
++
+ 	// Compute IMU and camera device poses for get_tracked_pose relations
+ 	math_pose_from_isometry(&hmd_config->imu_calibration.device_from_imu, &t->device_from_imu);
+ 
+@@ -543,6 +583,11 @@ rift_s_tracker_destroy(struct rift_s_tracker *t)
+ 
+ 	m_imu_3dof_close(&t->fusion.i3dof);
+ 	os_mutex_destroy(&t->mutex);
++
++	for (int i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++		xrt_frame_reference(&t->passthrough.frames[i], NULL);
++	}
++	os_mutex_destroy(&t->passthrough.mutex);
+ }
+ 
+ struct xrt_slam_sinks *
+@@ -672,6 +717,112 @@ raw_frame_ts_to_mono_ts(struct rift_s_tracker *t, uint64_t frame_ts_ns)
+ 	return frame_time;
+ }
+ 
++//! Copies an L8 frame (usually a region of the camera's frame) into a tightly packed frame of its own
++static struct xrt_frame *
++copy_frame_l8(struct xrt_frame *src)
++{
++	struct xrt_frame *dst = NULL;
++	u_frame_create_one_off(XRT_FORMAT_L8, src->width, src->height, &dst);
++	for (uint32_t y = 0; y < src->height; y++) {
++		memcpy(dst->data + y * dst->stride, src->data + y * src->stride, src->width);
++	}
++	dst->timestamp = src->timestamp;
++	return dst;
++}
++
++//! Keep the latest front camera images while the compositor asks for them
++static void
++rift_s_tracker_update_passthrough(struct rift_s_tracker *t,
++                                  timepoint_ns frame_mono_ns,
++                                  struct xrt_frame *frames[RIFT_S_CAMERA_COUNT])
++{
++	os_mutex_lock(&t->passthrough.mutex);
++	bool wanted = (os_monotonic_get_ns() - t->passthrough.last_request_ns) < PASSTHROUGH_REQUEST_TIMEOUT_NS;
++	os_mutex_unlock(&t->passthrough.mutex);
++
++	struct xrt_frame *copies[XRT_MAX_PASSTHROUGH_CAMERAS] = {0};
++	if (wanted) {
++		for (int i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++			if (frames[i] == NULL || frames[i]->format != XRT_FORMAT_L8) {
++				return;
++			}
++		}
++		// Copy outside the lock, the compositor polls every frame
++		for (int i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++			copies[i] = copy_frame_l8(frames[i]);
++		}
++	}
++
++	// Swap in the new images (or drop the old ones when nobody wants them), release outside the lock
++	os_mutex_lock(&t->passthrough.mutex);
++	for (int i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++		struct xrt_frame *old = t->passthrough.frames[i];
++		t->passthrough.frames[i] = copies[i];
++		copies[i] = old;
++	}
++	t->passthrough.timestamp_ns = wanted ? frame_mono_ns : 0;
++	os_mutex_unlock(&t->passthrough.mutex);
++
++	for (int i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++		xrt_frame_reference(&copies[i], NULL);
++	}
++}
++
++void
++rift_s_tracker_get_passthrough_frames(struct rift_s_tracker *t, bool want_images, struct xrt_passthrough_frames *out)
++{
++	U_ZERO(out);
++	timepoint_ns now = os_monotonic_get_ns();
++
++	os_mutex_lock(&t->passthrough.mutex);
++	out->forced = t->passthrough.forced;
++
++	if (want_images) {
++		t->passthrough.last_request_ns = now;
++
++		// Old images mean the camera stream stopped, show nothing rather than a frozen room
++		bool fresh = t->passthrough.timestamp_ns != 0 &&
++		             (now - t->passthrough.timestamp_ns) < PASSTHROUGH_MAX_FRAME_AGE_NS;
++		if (fresh && t->passthrough.frames[0] != NULL && t->passthrough.frames[1] != NULL) {
++			for (int i = 0; i < XRT_MAX_PASSTHROUGH_CAMERAS; i++) {
++				out->cameras[i] = t->passthrough.cams[i];
++				out->cameras[i].frame = NULL;
++				xrt_frame_reference(&out->cameras[i].frame, t->passthrough.frames[i]);
++				out->cameras[i].timestamp_ns = t->passthrough.timestamp_ns;
++			}
++			out->camera_count = XRT_MAX_PASSTHROUGH_CAMERAS;
++		}
++	}
++	os_mutex_unlock(&t->passthrough.mutex);
++}
++
++void
++rift_s_tracker_toggle_passthrough(struct rift_s_tracker *t)
++{
++	os_mutex_lock(&t->passthrough.mutex);
++	t->passthrough.forced = !t->passthrough.forced;
++	bool forced = t->passthrough.forced;
++	os_mutex_unlock(&t->passthrough.mutex);
++
++	RIFT_S_INFO("Passthrough %s", forced ? "on" : "off");
++}
++
++void
++rift_s_tracker_get_passthrough_status(struct rift_s_tracker *t,
++                                      timepoint_ns now,
++                                      bool *out_forced,
++                                      bool *out_streaming,
++                                      double *out_frame_age_ms)
++{
++	os_mutex_lock(&t->passthrough.mutex);
++	*out_forced = t->passthrough.forced;
++	*out_streaming = (now - t->passthrough.last_request_ns) < PASSTHROUGH_REQUEST_TIMEOUT_NS;
++	*out_frame_age_ms = t->passthrough.timestamp_ns != 0
++	                        ? (double)(now - t->passthrough.timestamp_ns) / U_TIME_1MS_IN_NS
++	                        : -1.0;
++	os_mutex_unlock(&t->passthrough.mutex);
++}
++
+ void
+ rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
+                                 uint64_t frame_ts_ns,
+@@ -713,6 +864,8 @@ rift_s_tracker_push_slam_frames(struct rift_s_tracker *t,
+ 			xrt_sink_push_frame(t->slam_sinks.cams[i], frames[i]);
+ 		}
+ 	}
++
++	rift_s_tracker_update_passthrough(t, frame_mono_ns, frames);
+ }
+ 
+ struct t_constellation_tracked_device_connection *
+diff --git a/src/xrt/drivers/rift_s/rift_s_tracker.h b/src/xrt/drivers/rift_s/rift_s_tracker.h
+index fb644c9..2fc027a 100644
+--- a/src/xrt/drivers/rift_s/rift_s_tracker.h
++++ b/src/xrt/drivers/rift_s/rift_s_tracker.h
+@@ -119,6 +119,26 @@ struct rift_s_tracker
+ 	struct t_constellation_tracker *controller_tracker;
+ 	struct xrt_frame_sink *controller_sink; //!< Sink to send controller frames to tracker
+ 
++	//! Latest front camera images for passthrough. Own copies, so the camera's buffers are not held.
++	struct
++	{
++		//! Protects this struct. Separate from @ref mutex so the compositor never waits on tracking.
++		struct os_mutex mutex;
++
++		//! FRONT_LEFT, FRONT_RIGHT (left eye, right eye)
++		struct xrt_frame *frames[XRT_MAX_PASSTHROUGH_CAMERAS];
++		timepoint_ns timestamp_ns;
++
++		//! Copies are only made while someone keeps asking for images
++		timepoint_ns last_request_ns;
++
++		//! Passthrough over all content (long press on the Oculus button, debug UI)
++		bool forced;
++
++		//! Camera poses and intrinsics; frame and timestamp unset
++		struct xrt_passthrough_camera cams[XRT_MAX_PASSTHROUGH_CAMERAS];
++	} passthrough;
++
+ 	struct
+ 	{
+ 		struct u_var_button hmd_screen_enable_btn;
+@@ -139,6 +159,19 @@ rift_s_tracker_destroy(struct rift_s_tracker *t);
+ void
+ rift_s_tracker_add_debug_ui(struct rift_s_tracker *t, void *root);
+ 
++void
++rift_s_tracker_get_passthrough_frames(struct rift_s_tracker *t, bool want_images, struct xrt_passthrough_frames *out);
++
++void
++rift_s_tracker_toggle_passthrough(struct rift_s_tracker *t);
++
++void
++rift_s_tracker_get_passthrough_status(struct rift_s_tracker *t,
++                                      timepoint_ns now,
++                                      bool *out_forced,
++                                      bool *out_streaming,
++                                      double *out_frame_age_ms);
++
+ struct t_constellation_tracked_device_connection *
+ rift_s_tracker_add_controller(struct rift_s_tracker *t,
+                               struct xrt_device *xdev,
+diff --git a/src/xrt/include/xrt/xrt_device.h b/src/xrt/include/xrt/xrt_device.h
+index 72dea4b..32a11e7 100644
+--- a/src/xrt/include/xrt/xrt_device.h
++++ b/src/xrt/include/xrt/xrt_device.h
+@@ -247,6 +247,51 @@ struct xrt_binding_profile
+ 	size_t output_count;
+ };
+ 
++struct xrt_frame;
++
++/*!
++ * Maximum number of cameras in @ref xrt_passthrough_frames.
++ */
++#define XRT_MAX_PASSTHROUGH_CAMERAS 2
++
++/*!
++ * One camera image for passthrough, with what is needed to reproject it.
++ *
++ * Camera space uses the OpenCV convention: +x right and +y down in the image, +z forward.
++ */
++struct xrt_passthrough_camera
++{
++	//! Latest image (L8), referenced, release with xrt_frame_reference(&frame, NULL).
++	struct xrt_frame *frame;
++
++	//! Capture time, monotonic clock.
++	int64_t timestamp_ns;
++
++	//! Camera pose relative to the device's head pose (XRT_INPUT_GENERIC_HEAD_POSE).
++	struct xrt_pose head_from_camera;
++
++	//! Fisheye62 projection: focal length and principal point in pixels.
++	float fx, fy, cx, cy;
++
++	//! Fisheye62 radial (k1..k6) and tangential (p1, p2) distortion.
++	float k[6];
++	float p1, p2;
++};
++
++/*!
++ * Camera images for passthrough, see @ref xrt_device::get_passthrough_frames.
++ */
++struct xrt_passthrough_frames
++{
++	//! The user asked for passthrough over all content (for example by holding a system button).
++	bool forced;
++
++	//! Number of valid cameras, view i uses cameras[i]; 0 when no images were requested or available.
++	uint32_t camera_count;
++
++	struct xrt_passthrough_camera cameras[XRT_MAX_PASSTHROUGH_CAMERAS];
++};
++
+ /*!
+  * Higher level features for devices.
+  */
+@@ -735,6 +780,20 @@ struct xrt_device
+ 	 */
+ 	xrt_result_t (*end_feature)(struct xrt_device *xdev, enum xrt_device_feature_type type);
+ 
++	/*!
++	 * @brief Get camera images for passthrough and whether the user forced passthrough on.
++	 *
++	 * This function should never block, and never wait on congested locks.
++	 *
++	 * @param[in] xdev         The device.
++	 * @param[in] want_images  Whether to return images; false only returns the forced flag. Devices may only
++	 *                         start capturing images once they are asked for.
++	 * @param[out] out_frames  Filled in, the caller must release the referenced frames.
++	 */
++	xrt_result_t (*get_passthrough_frames)(struct xrt_device *xdev,
++	                                       bool want_images,
++	                                       struct xrt_passthrough_frames *out_frames);
++
+ 	/*!
+ 	 * Destroy device.
+ 	 */
+@@ -1084,6 +1143,21 @@ xrt_device_get_brightness(struct xrt_device *xdev, float *out_brightness)
+ 	return xdev->get_brightness(xdev, out_brightness);
+ }
+ 
++/*!
++ * Helper function for @ref xrt_device::get_passthrough_frames.
++ *
++ * @copydoc xrt_device::get_passthrough_frames
++ * @public @memberof xrt_device
++ */
++XRT_NONNULL_ALL static inline xrt_result_t
++xrt_device_get_passthrough_frames(struct xrt_device *xdev, bool want_images, struct xrt_passthrough_frames *out_frames)
++{
++	if (xdev->get_passthrough_frames == NULL) {
++		return XRT_ERROR_NOT_IMPLEMENTED;
++	}
++	return xdev->get_passthrough_frames(xdev, want_images, out_frames);
++}
++
+ /*!
+  * Helper function for @ref xrt_device::set_brightness.
+  *
+-- 
+2.54.0
+

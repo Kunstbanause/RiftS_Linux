@@ -1,0 +1,1351 @@
+From cee73bde5ca4af81770332cffae83d21f21db499 Mon Sep 17 00:00:00 2001
+From: Kunstbanause <3209654+Kunstbanause@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:24:05 +0200
+Subject: [PATCH 2/7] d/rift_s: Add IMU + optical error-state Kalman filter for
+ controllers
+
+Strapdown ESKF (orientation, position, velocity, gyro and accel bias)
+driven by the controller IMU and corrected by delayed constellation
+poses. States are kept for 400 ms so optical fixes are applied at their
+exposure time and the IMU is replayed, and so that past-time queries
+give the constellation tracker accurate priors. Outliers are gated by
+Mahalanobis distance, short occlusions are bridged by dead reckoning
+with velocity decay, longer ones hold the position.
+
+Design and starting values follow the OpenHMD Rift CV1 6DoF UKF.
+Not wired into the driver yet; covered by synthetic-trajectory tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xrt/drivers/CMakeLists.txt                |   2 +
+ .../rift_s/rift_s_controller_fusion.cpp       | 658 ++++++++++++++++++
+ .../drivers/rift_s/rift_s_controller_fusion.h | 155 +++++
+ tests/CMakeLists.txt                          |  11 +
+ tests/tests_rift_s_controller_fusion.cpp      | 453 ++++++++++++
+ 5 files changed, 1279 insertions(+)
+ create mode 100644 src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+ create mode 100644 src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+ create mode 100644 tests/tests_rift_s_controller_fusion.cpp
+
+diff --git a/src/xrt/drivers/CMakeLists.txt b/src/xrt/drivers/CMakeLists.txt
+index c790830..b5d5621 100644
+--- a/src/xrt/drivers/CMakeLists.txt
++++ b/src/xrt/drivers/CMakeLists.txt
+@@ -348,6 +348,8 @@ if(XRT_BUILD_DRIVER_RIFT_S)
+ 		rift_s/rift_s_camera.h
+ 		rift_s/rift_s_controller.c
+ 		rift_s/rift_s_controller.h
++		rift_s/rift_s_controller_fusion.cpp
++		rift_s/rift_s_controller_fusion.h
+ 		rift_s/rift_s_firmware.c
+ 		rift_s/rift_s_firmware.h
+ 		rift_s/rift_s_hmd.c
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+new file mode 100644
+index 0000000..40b9726
+--- /dev/null
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
+@@ -0,0 +1,658 @@
++// Copyright 2026, Kunstbanause
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  IMU + optical sensor fusion for Rift S Touch controllers.
++ *
++ * Error-state Kalman filter (ESKF). Nominal state: orientation q (world from
++ * IMU), position p, velocity v, gyro bias bg, accelerometer bias ba. The error
++ * state is 15-dimensional, with the orientation error expressed in the IMU
++ * frame: q_true = q * Exp(dtheta).
++ *
++ * The state after every IMU sample is kept for a short time. An optical pose
++ * for a frame exposed at time t rewinds to the last state before t, applies the
++ * correction there and replays the IMU samples that arrived since. That is the
++ * equivalent of the delay slots in the OpenHMD Rift CV1 UKF.
++ *
++ * @ingroup drv_rift_s
++ */
++
++#include "rift_s_controller_fusion.h"
++
++#include "math/m_eigen_interop.hpp"
++#include "math/m_mathinclude.h"
++
++#include <Eigen/Core>
++#include <Eigen/Geometry>
++
++#include <algorithm>
++#include <cmath>
++#include <deque>
++#include <memory>
++
++namespace {
++
++using Eigen::Matrix3d;
++using Eigen::Quaterniond;
++using Eigen::Vector3d;
++using Mat15 = Eigen::Matrix<double, 15, 15>;
++using Vec15 = Eigen::Matrix<double, 15, 1>;
++using Mat6 = Eigen::Matrix<double, 6, 6>;
++using Vec6 = Eigen::Matrix<double, 6, 1>;
++
++// Error state layout
++constexpr int ERR_ROT = 0;
++constexpr int ERR_POS = 3;
++constexpr int ERR_VEL = 6;
++constexpr int ERR_BG = 9;
++constexpr int ERR_BA = 12;
++
++constexpr double GRAVITY = 9.80665;
++constexpr double NS_PER_S = 1e9;
++
++//! How long states are kept for delayed optical fixes and past-time queries
++constexpr int64_t HISTORY_NS = 400 * 1000 * 1000;
++//! How long raw IMU samples are kept (needs to cover init + history)
++constexpr int64_t IMU_BUFFER_NS = 500 * 1000 * 1000;
++//! Orientation integration step clamp for long IMU gaps
++constexpr double MAX_GYRO_DT = 0.05;
++
++//! Bias clamps, as in the OpenHMD filter
++constexpr double MAX_GYRO_BIAS = 0.3;
++constexpr double MAX_ACCEL_BIAS = 1.0;
++
++//! Gravity (tilt) pseudo-measurement while held unseen and static
++constexpr double GRAVITY_MEAS_SIGMA = 0.5;
++constexpr double GRAVITY_MEAS_MAX_ACCEL_DEV = 0.3;
++constexpr double GRAVITY_MEAS_MAX_GYRO = 0.2;
++constexpr int GRAVITY_MEAS_EVERY_N = 10;
++constexpr double GRAVITY_GATE_CHI2 = 11.3; // 3 dof, 99%
++
++const Vector3d G_UP(0.0, GRAVITY, 0.0);
++
++inline Matrix3d
++skew(const Vector3d &v)
++{
++	Matrix3d m;
++	m << 0, -v.z(), v.y(), //
++	    v.z(), 0, -v.x(),  //
++	    -v.y(), v.x(), 0;
++	return m;
++}
++
++inline Quaterniond
++so3_exp(const Vector3d &w)
++{
++	double angle = w.norm();
++	if (angle < 1e-12) {
++		return Quaterniond(1.0, 0.5 * w.x(), 0.5 * w.y(), 0.5 * w.z()).normalized();
++	}
++	return Quaterniond(Eigen::AngleAxisd(angle, w / angle));
++}
++
++inline Vector3d
++so3_log(Quaterniond q)
++{
++	if (q.w() < 0) {
++		q.coeffs() = -q.coeffs();
++	}
++	Vector3d v = q.vec();
++	double sin_half = v.norm();
++	if (sin_half < 1e-12) {
++		return 2.0 * v;
++	}
++	double angle = 2.0 * std::atan2(sin_half, q.w());
++	return v * (angle / sin_half);
++}
++
++inline double
++ns_to_s(int64_t ns)
++{
++	return (double)ns / NS_PER_S;
++}
++
++struct State
++{
++	Quaterniond q{Quaterniond::Identity()};
++	Vector3d p{Vector3d::Zero()};
++	Vector3d v{Vector3d::Zero()};
++	Vector3d bg{Vector3d::Zero()};
++	Vector3d ba{Vector3d::Zero()};
++};
++
++struct ImuSample
++{
++	int64_t ts;
++	Vector3d gyro;
++	Vector3d accel;
++};
++
++struct HistoryEntry
++{
++	int64_t ts;
++	State x;
++	Mat15 P;
++	//! Bias-corrected gyro of the sample that produced this entry, world frame
++	Vector3d world_ang_vel;
++	//! Gravity-free acceleration of the sample that produced this entry, world frame
++	Vector3d world_accel;
++};
++
++class ControllerFusion
++{
++public:
++	explicit ControllerFusion(const rift_s_ctrl_fusion_params &params) : params_(params) {}
++
++	rift_s_ctrl_fusion_params params_;
++	rift_s_ctrl_fusion_stats stats_{};
++
++	void
++	imu(const ImuSample &s)
++	{
++		if (!imu_buf_.empty() && s.ts <= imu_buf_.back().ts) {
++			return;
++		}
++		stats_.imu_samples++;
++
++		imu_buf_.push_back(s);
++		while (!imu_buf_.empty() && s.ts - imu_buf_.front().ts > IMU_BUFFER_NS) {
++			imu_buf_.pop_front();
++		}
++
++		if (!initialised_) {
++			return;
++		}
++
++		step_and_record(s);
++		trim_history();
++	}
++
++	rift_s_ctrl_fusion_pose_result
++	pose(int64_t frame_ts, const Vector3d &z_p, const Quaterniond &z_q)
++	{
++		if (imu_buf_.empty()) {
++			stats_.poses_ignored++;
++			return RIFT_S_CTRL_FUSION_POSE_IGNORED;
++		}
++
++		if (!initialised_) {
++			reinit(frame_ts, z_p, z_q, false);
++			return RIFT_S_CTRL_FUSION_POSE_RESET;
++		}
++
++		if (frame_ts < history_.front().ts) {
++			stats_.poses_ignored++;
++			return RIFT_S_CTRL_FUSION_POSE_IGNORED;
++		}
++
++		// Find the last state at or before the exposure time
++		auto it = std::upper_bound(history_.begin(), history_.end(), frame_ts,
++		                           [](int64_t t, const HistoryEntry &e) { return t < e.ts; });
++		size_t base_idx = (size_t)(std::distance(history_.begin(), it) - 1);
++
++		State x = history_[base_idx].x;
++		Mat15 P = history_[base_idx].P;
++		int64_t t = history_[base_idx].ts;
++
++		// Propagate from the base state to the exposure time with the next IMU sample (or the last one)
++		if (frame_ts > t) {
++			const ImuSample *next = imu_sample_after(t);
++			const ImuSample &s = next != nullptr ? *next : imu_buf_.back();
++			Vector3d unused_w, unused_a;
++			propagate(x, P, s, ns_to_s(frame_ts - t), frame_ts, unused_w, unused_a);
++		}
++
++		double chi2 = 0;
++		bool accepted = correct_pose(x, P, z_p, z_q, chi2);
++		stats_.last_chi2 = (float)chi2;
++		stats_.last_pos_innovation = (float)(z_p - x.p).norm();
++
++		if (!accepted) {
++			stats_.poses_rejected++;
++			if (++consecutive_rejects_ >= params_.reset_after_rejects) {
++				reinit(frame_ts, z_p, z_q, true);
++				return RIFT_S_CTRL_FUSION_POSE_RESET;
++			}
++			return RIFT_S_CTRL_FUSION_POSE_REJECTED;
++		}
++
++		consecutive_rejects_ = 0;
++		stats_.poses_accepted++;
++		stats_.last_fix_delay = (float)ns_to_s(history_.back().ts - frame_ts);
++		last_fix_ts_ = std::max(last_fix_ts_, frame_ts);
++
++		// Drop the now-stale future, insert the corrected state and replay the IMU
++		history_.erase(history_.begin() + (long)base_idx + 1, history_.end());
++		push_history(frame_ts, x, P, history_[base_idx].world_ang_vel, history_[base_idx].world_accel);
++		replay_from(frame_ts);
++		return RIFT_S_CTRL_FUSION_POSE_ACCEPTED;
++	}
++
++	bool
++	get_relation(int64_t at, xrt_space_relation &out)
++	{
++		out = xrt_space_relation{};
++		if (!initialised_ || history_.empty()) {
++			return false;
++		}
++
++		const HistoryEntry &newest = history_.back();
++		State x;
++		Vector3d world_ang_vel;
++		Vector3d world_accel;
++
++		if (at >= newest.ts) {
++			double dt = std::min(ns_to_s(at - newest.ts), (double)params_.prediction_max);
++			x = newest.x;
++			world_ang_vel = newest.world_ang_vel;
++			world_accel = newest.world_accel;
++
++			// Rotate with the current angular velocity (world frame)
++			x.q = (so3_exp(world_ang_vel * dt) * x.q).normalized();
++			if (!holding(newest.ts)) {
++				x.p += x.v * dt;
++				if (params_.predict_with_accel) {
++					x.p += 0.5 * world_accel * dt * dt;
++					x.v += world_accel * dt;
++				}
++			}
++		} else if (at <= history_.front().ts) {
++			const HistoryEntry &e = history_.front();
++			x = e.x;
++			world_ang_vel = e.world_ang_vel;
++			world_accel = e.world_accel;
++		} else {
++			auto it = std::upper_bound(history_.begin(), history_.end(), at,
++			                           [](int64_t t, const HistoryEntry &e) { return t < e.ts; });
++			const HistoryEntry &e1 = *it;
++			const HistoryEntry &e0 = *(it - 1);
++			double span = (double)(e1.ts - e0.ts);
++			double alpha = span > 0 ? (double)(at - e0.ts) / span : 1.0;
++			x = e1.x;
++			x.p = e0.x.p + alpha * (e1.x.p - e0.x.p);
++			x.v = e0.x.v + alpha * (e1.x.v - e0.x.v);
++			x.q = e0.x.q.slerp(alpha, e1.x.q);
++			world_ang_vel = e1.world_ang_vel;
++			world_accel = e1.world_accel;
++		}
++
++		xrt::auxiliary::math::map_quat(out.pose.orientation) = x.q.cast<float>();
++		xrt::auxiliary::math::map_vec3(out.pose.position) = x.p.cast<float>();
++		xrt::auxiliary::math::map_vec3(out.linear_velocity) = x.v.cast<float>();
++		xrt::auxiliary::math::map_vec3(out.angular_velocity) = world_ang_vel.cast<float>();
++
++		int flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
++		            XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT |
++		            XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
++		if (!holding(std::min(at, newest.ts))) {
++			flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
++		}
++		out.relation_flags = (enum xrt_space_relation_flags)flags;
++		return true;
++	}
++
++	bool
++	initialised() const
++	{
++		return initialised_;
++	}
++
++	void
++	fill_stats(rift_s_ctrl_fusion_stats &out) const
++	{
++		out = stats_;
++		if (!history_.empty()) {
++			const State &x = history_.back().x;
++			xrt::auxiliary::math::map_vec3(out.gyro_bias) = x.bg.cast<float>();
++			xrt::auxiliary::math::map_vec3(out.accel_bias) = x.ba.cast<float>();
++		}
++	}
++
++private:
++	bool initialised_{false};
++	int consecutive_rejects_{0};
++	int gravity_meas_counter_{0};
++	int64_t last_fix_ts_{0};
++
++	std::deque<ImuSample> imu_buf_;
++	std::deque<HistoryEntry> history_;
++
++	bool
++	holding(int64_t ts) const
++	{
++		return ns_to_s(ts - last_fix_ts_) >= params_.coast_max;
++	}
++
++	const ImuSample *
++	imu_sample_after(int64_t t) const
++	{
++		auto it = std::upper_bound(imu_buf_.begin(), imu_buf_.end(), t,
++		                           [](int64_t ts, const ImuSample &s) { return ts < s.ts; });
++		return it == imu_buf_.end() ? nullptr : &*it;
++	}
++
++	void
++	reinit(int64_t frame_ts, const Vector3d &z_p, const Quaterniond &z_q, bool keep_biases)
++	{
++		State x;
++		if (keep_biases && !history_.empty()) {
++			x.bg = history_.back().x.bg;
++			x.ba = history_.back().x.ba;
++		}
++		x.q = z_q.normalized();
++		x.p = z_p;
++		x.v = Vector3d::Zero();
++
++		Mat15 P = Mat15::Zero();
++		P.block<3, 3>(ERR_ROT, ERR_ROT).diagonal().setConstant(std::pow(params_.optical_rot_sigma, 2) * 4);
++		P.block<3, 3>(ERR_POS, ERR_POS).diagonal().setConstant(std::pow(params_.optical_pos_sigma, 2) * 4);
++		P.block<3, 3>(ERR_VEL, ERR_VEL).diagonal().setConstant(0.5 * 0.5);
++		P.block<3, 3>(ERR_BG, ERR_BG).diagonal().setConstant(keep_biases ? 1e-4 : 1e-3);
++		P.block<3, 3>(ERR_BA, ERR_BA).diagonal().setConstant(keep_biases ? 0.05 : 0.25);
++
++		history_.clear();
++		initialised_ = true;
++		consecutive_rejects_ = 0;
++		last_fix_ts_ = frame_ts;
++		stats_.resets++;
++
++		push_history(frame_ts, x, P, Vector3d::Zero(), Vector3d::Zero());
++		replay_from(frame_ts);
++	}
++
++	void
++	push_history(int64_t ts, const State &x, const Mat15 &P, const Vector3d &w, const Vector3d &a)
++	{
++		history_.push_back(HistoryEntry{ts, x, P, w, a});
++	}
++
++	void
++	trim_history()
++	{
++		// Always keep at least one entry
++		while (history_.size() > 1 && history_.back().ts - history_.front().ts > HISTORY_NS) {
++			history_.pop_front();
++		}
++	}
++
++	//! Propagate the newest history state with one IMU sample and record the result
++	void
++	step_and_record(const ImuSample &s)
++	{
++		const HistoryEntry &prev = history_.back();
++		if (s.ts <= prev.ts) {
++			return;
++		}
++		State x = prev.x;
++		Mat15 P = prev.P;
++		Vector3d w, a;
++		propagate(x, P, s, ns_to_s(s.ts - prev.ts), s.ts, w, a);
++		maybe_correct_gravity(x, P, s);
++		push_history(s.ts, x, P, w, a);
++	}
++
++	void
++	replay_from(int64_t ts)
++	{
++		auto it = std::upper_bound(imu_buf_.begin(), imu_buf_.end(), ts,
++		                           [](int64_t t, const ImuSample &s) { return t < s.ts; });
++		for (; it != imu_buf_.end(); ++it) {
++			step_and_record(*it);
++		}
++		trim_history();
++	}
++
++	/*!
++	 * Strapdown propagation of the nominal state plus covariance over @p dt
++	 * using sample @p s (zero-order hold over the interval ending at s.ts).
++	 */
++	void
++	propagate(State &x, Mat15 &P, const ImuSample &s, double dt, int64_t t_end, Vector3d &out_world_ang_vel,
++	          Vector3d &out_world_accel) const
++	{
++		if (dt <= 0) {
++			return;
++		}
++		const Vector3d w = s.gyro - x.bg;
++		const Vector3d a = s.accel - x.ba;
++		const Matrix3d R = x.q.toRotationMatrix();
++		const Vector3d a_world = R * a - G_UP;
++
++		out_world_ang_vel = R * w;
++		out_world_accel = a_world;
++
++		const double since_fix = ns_to_s(t_end - last_fix_ts_);
++		const bool hold = since_fix >= params_.coast_max;
++		const bool coast = since_fix >= params_.coast_start;
++		const bool imu_gap = dt > params_.imu_gap_max;
++
++		// Orientation
++		const double dt_rot = std::min(dt, MAX_GYRO_DT);
++		const Quaterniond dq = so3_exp(w * dt_rot);
++		x.q = (x.q * dq).normalized();
++
++		Mat15 F = Mat15::Identity();
++		F.block<3, 3>(ERR_ROT, ERR_ROT) = dq.toRotationMatrix().transpose();
++		F.block<3, 3>(ERR_ROT, ERR_BG) = -Matrix3d::Identity() * dt_rot;
++
++		// Position / velocity
++		if (hold) {
++			x.v.setZero();
++		} else if (imu_gap) {
++			// Missing IMU data, the accelerometer value can't be trusted over the gap
++			x.p += x.v * dt;
++			F.block<3, 3>(ERR_POS, ERR_VEL) = Matrix3d::Identity() * dt;
++		} else {
++			x.p += x.v * dt + 0.5 * a_world * dt * dt;
++			x.v += a_world * dt;
++			F.block<3, 3>(ERR_POS, ERR_VEL) = Matrix3d::Identity() * dt;
++			F.block<3, 3>(ERR_VEL, ERR_ROT) = -R * skew(a) * dt;
++			F.block<3, 3>(ERR_VEL, ERR_BA) = -R * dt;
++		}
++
++		double vel_decay = 1.0;
++		if (coast && !hold) {
++			vel_decay = std::exp(-dt / params_.coast_vel_tau);
++			x.v *= vel_decay;
++			F.block<3, 3>(ERR_VEL, ERR_VEL) *= vel_decay;
++		}
++
++		Mat15 Q = Mat15::Zero();
++		Q.block<3, 3>(ERR_ROT, ERR_ROT).diagonal().setConstant(std::pow(params_.gyro_noise, 2) * dt_rot);
++		Q.block<3, 3>(ERR_VEL, ERR_VEL).diagonal().setConstant(std::pow(params_.accel_noise, 2) * dt);
++		Q.block<3, 3>(ERR_BG, ERR_BG).diagonal().setConstant(std::pow(params_.gyro_bias_noise, 2) * dt);
++		Q.block<3, 3>(ERR_BA, ERR_BA).diagonal().setConstant(std::pow(params_.accel_bias_noise, 2) * dt);
++		if (coast && !hold) {
++			Q.block<3, 3>(ERR_VEL, ERR_VEL).diagonal().array() += std::pow(params_.coast_accel_noise, 2) * dt;
++		}
++		if (hold) {
++			Q.block<3, 3>(ERR_POS, ERR_POS).diagonal().setConstant(std::pow(params_.hold_pos_noise, 2) * dt);
++		}
++
++		P = F * P * F.transpose() + Q;
++		P = 0.5 * (P + P.transpose());
++	}
++
++	void
++	inject(State &x, const Vec15 &dx) const
++	{
++		x.q = (x.q * so3_exp(dx.segment<3>(ERR_ROT))).normalized();
++		x.p += dx.segment<3>(ERR_POS);
++		x.v += dx.segment<3>(ERR_VEL);
++		x.bg = (x.bg + dx.segment<3>(ERR_BG)).cwiseMax(-MAX_GYRO_BIAS).cwiseMin(MAX_GYRO_BIAS);
++		x.ba = (x.ba + dx.segment<3>(ERR_BA)).cwiseMax(-MAX_ACCEL_BIAS).cwiseMin(MAX_ACCEL_BIAS);
++	}
++
++	//! Optical position + orientation update, returns false if gated out (state untouched).
++	bool
++	correct_pose(State &x, Mat15 &P, const Vector3d &z_p, const Quaterniond &z_q, double &out_chi2) const
++	{
++		Vec6 r;
++		r.segment<3>(0) = z_p - x.p;
++		r.segment<3>(3) = so3_log(x.q.conjugate() * z_q.normalized());
++
++		Eigen::Matrix<double, 6, 15> H = Eigen::Matrix<double, 6, 15>::Zero();
++		H.block<3, 3>(0, ERR_POS) = Matrix3d::Identity();
++		H.block<3, 3>(3, ERR_ROT) = Matrix3d::Identity();
++
++		Mat6 Rm = Mat6::Zero();
++		Rm.diagonal().segment<3>(0).setConstant(std::pow(params_.optical_pos_sigma, 2));
++		Rm.diagonal().segment<3>(3).setConstant(std::pow(params_.optical_rot_sigma, 2));
++
++		const Mat6 S = H * P * H.transpose() + Rm;
++		const Eigen::LDLT<Mat6> S_ldlt(S);
++		out_chi2 = r.dot(S_ldlt.solve(r));
++		if (!std::isfinite(out_chi2) || out_chi2 > params_.gate_chi2) {
++			return false;
++		}
++
++		const Eigen::Matrix<double, 15, 6> K = P * H.transpose() * S_ldlt.solve(Mat6::Identity());
++		inject(x, K * r);
++
++		const Mat15 IKH = Mat15::Identity() - K * H;
++		P = IKH * P * IKH.transpose() + K * Rm * K.transpose();
++		P = 0.5 * (P + P.transpose());
++		return true;
++	}
++
++	/*!
++	 * While the position is held (controller unseen), use the accelerometer as a
++	 * gravity direction measurement when the controller is static, so that pitch
++	 * and roll don't drift during long occlusions.
++	 */
++	void
++	maybe_correct_gravity(State &x, Mat15 &P, const ImuSample &s)
++	{
++		if (!holding(s.ts) || ++gravity_meas_counter_ < GRAVITY_MEAS_EVERY_N) {
++			return;
++		}
++		gravity_meas_counter_ = 0;
++
++		const Vector3d w = s.gyro - x.bg;
++		if (std::fabs(s.accel.norm() - GRAVITY) > GRAVITY_MEAS_MAX_ACCEL_DEV || w.norm() > GRAVITY_MEAS_MAX_GYRO) {
++			return;
++		}
++
++		const Matrix3d R = x.q.toRotationMatrix();
++		const Vector3d g_body = R.transpose() * G_UP;
++		const Vector3d r = s.accel - (g_body + x.ba);
++
++		Eigen::Matrix<double, 3, 15> H = Eigen::Matrix<double, 3, 15>::Zero();
++		H.block<3, 3>(0, ERR_ROT) = skew(g_body);
++		H.block<3, 3>(0, ERR_BA) = Matrix3d::Identity();
++
++		const Matrix3d Rm = Matrix3d::Identity() * GRAVITY_MEAS_SIGMA * GRAVITY_MEAS_SIGMA;
++		const Matrix3d S = H * P * H.transpose() + Rm;
++		const Eigen::LDLT<Matrix3d> S_ldlt(S);
++		if (r.dot(S_ldlt.solve(r)) > GRAVITY_GATE_CHI2) {
++			return;
++		}
++
++		const Eigen::Matrix<double, 15, 3> K = P * H.transpose() * S_ldlt.solve(Matrix3d::Identity());
++		Vec15 dx = K * r;
++		// Only tilt and accel bias are observable here; don't move position or velocity
++		dx.segment<3>(ERR_POS).setZero();
++		dx.segment<3>(ERR_VEL).setZero();
++		inject(x, dx);
++
++		const Mat15 IKH = Mat15::Identity() - K * H;
++		P = IKH * P * IKH.transpose() + K * Rm * K.transpose();
++		P = 0.5 * (P + P.transpose());
++	}
++};
++
++} // namespace
++
++struct rift_s_ctrl_fusion
++{
++	std::unique_ptr<ControllerFusion> impl;
++};
++
++extern "C" void
++rift_s_ctrl_fusion_default_params(struct rift_s_ctrl_fusion_params *out)
++{
++	*out = rift_s_ctrl_fusion_params{};
++	out->gyro_noise = 1.5e-3f;
++	out->accel_noise = 0.05f;
++	out->gyro_bias_noise = 2e-4f;
++	out->accel_bias_noise = 2e-3f;
++
++	out->optical_pos_sigma = 0.005f;
++	out->optical_rot_sigma = 0.035f;
++
++	out->gate_chi2 = 30.0f;
++	out->reset_after_rejects = 4;
++
++	out->coast_start = 0.2f;
++	out->coast_vel_tau = 0.2f;
++	out->coast_accel_noise = 3.0f;
++	out->coast_max = 0.45f;
++	out->hold_pos_noise = 0.5f;
++
++	out->imu_gap_max = 0.02f;
++	out->prediction_max = 0.05f;
++	out->predict_with_accel = false;
++}
++
++extern "C" struct rift_s_ctrl_fusion *
++rift_s_ctrl_fusion_create(const struct rift_s_ctrl_fusion_params *params)
++{
++	auto *f = new rift_s_ctrl_fusion;
++	f->impl = std::make_unique<ControllerFusion>(*params);
++	return f;
++}
++
++extern "C" void
++rift_s_ctrl_fusion_destroy(struct rift_s_ctrl_fusion **fusion_ptr)
++{
++	if (fusion_ptr == nullptr || *fusion_ptr == nullptr) {
++		return;
++	}
++	delete *fusion_ptr;
++	*fusion_ptr = nullptr;
++}
++
++extern "C" struct rift_s_ctrl_fusion_params *
++rift_s_ctrl_fusion_params_ptr(struct rift_s_ctrl_fusion *fusion)
++{
++	return &fusion->impl->params_;
++}
++
++extern "C" void
++rift_s_ctrl_fusion_imu(struct rift_s_ctrl_fusion *fusion,
++                       int64_t timestamp_ns,
++                       const struct xrt_vec3 *gyro,
++                       const struct xrt_vec3 *accel)
++{
++	ImuSample s{timestamp_ns, xrt::auxiliary::math::map_vec3(*gyro).cast<double>(),
++	            xrt::auxiliary::math::map_vec3(*accel).cast<double>()};
++	fusion->impl->imu(s);
++}
++
++extern "C" enum rift_s_ctrl_fusion_pose_result
++rift_s_ctrl_fusion_pose(struct rift_s_ctrl_fusion *fusion, int64_t frame_timestamp_ns, const struct xrt_pose *pose)
++{
++	Vector3d p = xrt::auxiliary::math::map_vec3(pose->position).cast<double>();
++	Quaterniond q = xrt::auxiliary::math::map_quat(pose->orientation).cast<double>();
++	return fusion->impl->pose(frame_timestamp_ns, p, q);
++}
++
++extern "C" bool
++rift_s_ctrl_fusion_get_relation(struct rift_s_ctrl_fusion *fusion,
++                                int64_t at_timestamp_ns,
++                                struct xrt_space_relation *out_relation)
++{
++	return fusion->impl->get_relation(at_timestamp_ns, *out_relation);
++}
++
++extern "C" bool
++rift_s_ctrl_fusion_is_initialised(const struct rift_s_ctrl_fusion *fusion)
++{
++	return fusion->impl->initialised();
++}
++
++extern "C" void
++rift_s_ctrl_fusion_get_stats(const struct rift_s_ctrl_fusion *fusion, struct rift_s_ctrl_fusion_stats *out_stats)
++{
++	fusion->impl->fill_stats(*out_stats);
++}
+diff --git a/src/xrt/drivers/rift_s/rift_s_controller_fusion.h b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+new file mode 100644
+index 0000000..ee4a978
+--- /dev/null
++++ b/src/xrt/drivers/rift_s/rift_s_controller_fusion.h
+@@ -0,0 +1,155 @@
++// Copyright 2026, Kunstbanause
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  IMU + optical sensor fusion for Rift S Touch controllers.
++ *
++ * Error-state Kalman filter driven by the controller IMU, corrected by
++ * (delayed) optical constellation tracking poses. The filter keeps a short
++ * history of states so that optical fixes can be applied at the time the
++ * camera exposure happened, and so that the constellation tracker can query
++ * accurate pose priors for past frame timestamps.
++ *
++ * Structure and starting noise values follow the OpenHMD Rift CV1 6DoF UKF
++ * by Jan Schmidt (rift-kalman-6dof.c).
++ *
++ * All poses are of the controller IMU in the tracking (world) space, Y up.
++ * Not thread safe; callers serialise access.
++ *
++ * @ingroup drv_rift_s
++ */
++#pragma once
++
++#include "xrt/xrt_defines.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct rift_s_ctrl_fusion;
++
++//! Tunable filter parameters, see rift_s_ctrl_fusion_default_params for values.
++struct rift_s_ctrl_fusion_params
++{
++	//! Gyro white noise density (rad/s/sqrt(Hz))
++	float gyro_noise;
++	//! Accelerometer white noise density (m/s^2/sqrt(Hz))
++	float accel_noise;
++	//! Gyro bias random walk (rad/s^2/sqrt(Hz))
++	float gyro_bias_noise;
++	//! Accelerometer bias random walk (m/s^3/sqrt(Hz))
++	float accel_bias_noise;
++
++	//! Optical position measurement std dev (m)
++	float optical_pos_sigma;
++	//! Optical orientation measurement std dev (rad)
++	float optical_rot_sigma;
++
++	//! Chi-squared gate on the 6-dof optical innovation (rejects bad LED matches)
++	float gate_chi2;
++	//! Re-initialise from the optical pose after this many consecutive gate rejections
++	int reset_after_rejects;
++
++	//! Time without an accepted fix after which velocity starts decaying (s)
++	float coast_start;
++	//! Time constant of the velocity decay while coasting (s)
++	float coast_vel_tau;
++	//! Extra velocity process noise while coasting, covers unmodelled hand motion (m/s^2/sqrt(Hz))
++	float coast_accel_noise;
++	//! Time without an accepted fix after which position is held still and reported untracked (s)
++	float coast_max;
++	//! Position process noise while position is held (m/sqrt(s)), lets re-acquisition pass the gate
++	float hold_pos_noise;
++
++	//! IMU sample gaps longer than this are bridged with constant velocity instead of the accelerometer (s)
++	float imu_gap_max;
++	//! Maximum forward prediction horizon for pose queries (s)
++	float prediction_max;
++	//! Include the measured acceleration when predicting forward
++	bool predict_with_accel;
++};
++
++//! Result of feeding an optical pose to the filter.
++enum rift_s_ctrl_fusion_pose_result
++{
++	RIFT_S_CTRL_FUSION_POSE_ACCEPTED,
++	RIFT_S_CTRL_FUSION_POSE_REJECTED,
++	//! Filter (re)initialised from this pose
++	RIFT_S_CTRL_FUSION_POSE_RESET,
++	//! Fix is older than the state history, or no IMU data yet
++	RIFT_S_CTRL_FUSION_POSE_IGNORED,
++};
++
++//! Statistics for the debug UI and tests.
++struct rift_s_ctrl_fusion_stats
++{
++	uint64_t imu_samples;
++	uint64_t poses_accepted;
++	uint64_t poses_rejected;
++	uint64_t resets;
++	uint64_t poses_ignored;
++	//! Squared Mahalanobis distance of the last optical innovation
++	float last_chi2;
++	//! Position innovation of the last optical fix (m)
++	float last_pos_innovation;
++	//! Delay between the last fix's exposure and the newest IMU sample when it was applied (s)
++	float last_fix_delay;
++	//! Current gyro / accelerometer bias estimates
++	struct xrt_vec3 gyro_bias;
++	struct xrt_vec3 accel_bias;
++};
++
++void
++rift_s_ctrl_fusion_default_params(struct rift_s_ctrl_fusion_params *out_params);
++
++struct rift_s_ctrl_fusion *
++rift_s_ctrl_fusion_create(const struct rift_s_ctrl_fusion_params *params);
++
++void
++rift_s_ctrl_fusion_destroy(struct rift_s_ctrl_fusion **fusion_ptr);
++
++//! Pointer to the live parameters, e.g. for the debug UI. Changes apply to subsequent updates.
++struct rift_s_ctrl_fusion_params *
++rift_s_ctrl_fusion_params_ptr(struct rift_s_ctrl_fusion *fusion);
++
++/*!
++ * Feed one IMU sample. Timestamps must be in the monotonic clock domain of the
++ * optical poses; samples that are not newer than the previous one are dropped.
++ *
++ * @param gyro Angular velocity in the IMU frame (rad/s)
++ * @param accel Specific force in the IMU frame (m/s^2), reads +g upward at rest
++ */
++void
++rift_s_ctrl_fusion_imu(struct rift_s_ctrl_fusion *fusion,
++                       int64_t timestamp_ns,
++                       const struct xrt_vec3 *gyro,
++                       const struct xrt_vec3 *accel);
++
++//! Feed an optical pose of the IMU observed in a camera frame exposed at @p frame_timestamp_ns.
++enum rift_s_ctrl_fusion_pose_result
++rift_s_ctrl_fusion_pose(struct rift_s_ctrl_fusion *fusion, int64_t frame_timestamp_ns, const struct xrt_pose *pose);
++
++/*!
++ * Get the filtered IMU pose at @p at_timestamp_ns, predicting forward (clamped) or
++ * interpolating from the history as needed.
++ *
++ * @return false if the filter has not been initialised from an optical pose yet.
++ */
++bool
++rift_s_ctrl_fusion_get_relation(struct rift_s_ctrl_fusion *fusion,
++                                int64_t at_timestamp_ns,
++                                struct xrt_space_relation *out_relation);
++
++//! Whether the filter has been initialised from an optical pose.
++bool
++rift_s_ctrl_fusion_is_initialised(const struct rift_s_ctrl_fusion *fusion);
++
++void
++rift_s_ctrl_fusion_get_stats(const struct rift_s_ctrl_fusion *fusion, struct rift_s_ctrl_fusion_stats *out_stats);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 0d0789d..eb81190 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -61,6 +61,17 @@ endforeach()
+ target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
+ target_link_libraries(tests_glue_device PRIVATE xrt-interfaces aux_glue)
+ target_link_libraries(tests_history_buf PRIVATE aux_math)
++
++if(XRT_BUILD_DRIVER_RIFT_S)
++	add_executable(
++		tests_rift_s_controller_fusion tests_rift_s_controller_fusion.cpp
++		${CMAKE_SOURCE_DIR}/src/xrt/drivers/rift_s/rift_s_controller_fusion.cpp
++		)
++	target_include_directories(tests_rift_s_controller_fusion PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt)
++	target_link_libraries(tests_rift_s_controller_fusion PRIVATE xrt-external-catch2 aux_math xrt-interfaces)
++	add_test(NAME tests_rift_s_controller_fusion COMMAND tests_rift_s_controller_fusion)
++	set_target_properties(tests_rift_s_controller_fusion PROPERTIES FOLDER monado_tests)
++endif()
+ target_link_libraries(tests_lowpass_float PRIVATE aux_math)
+ target_link_libraries(tests_lowpass_integer PRIVATE aux_math)
+ target_link_libraries(tests_quatexpmap PRIVATE aux_math)
+diff --git a/tests/tests_rift_s_controller_fusion.cpp b/tests/tests_rift_s_controller_fusion.cpp
+new file mode 100644
+index 0000000..575c17f
+--- /dev/null
++++ b/tests/tests_rift_s_controller_fusion.cpp
+@@ -0,0 +1,453 @@
++// Copyright 2026, Kunstbanause
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief Synthetic-trajectory tests for the Rift S controller IMU + optical fusion.
++ */
++
++#include "drivers/rift_s/rift_s_controller_fusion.h"
++
++#include "catch_amalgamated.hpp"
++
++#include <Eigen/Core>
++#include <Eigen/Geometry>
++
++#include <cmath>
++#include <deque>
++#include <random>
++#include <vector>
++
++using Eigen::Quaterniond;
++using Eigen::Vector3d;
++
++namespace {
++
++constexpr double kGravity = 9.80665;
++constexpr int64_t kMs = 1000 * 1000;
++constexpr int64_t kImuPeriod = 2 * kMs;    // 500 Hz
++constexpr int64_t kFixPeriod = 33 * kMs;   // ~30 Hz
++constexpr int64_t kFixDelay = 25 * kMs;    // exposure -> pose available
++constexpr double kOpticalPosSigma = 0.003; // m
++constexpr double kOpticalRotSigma = 0.015; // rad
++
++double
++s_of(int64_t ns)
++{
++	return (double)ns / 1e9;
++}
++
++//! Ground-truth controller motion: per-axis sinusoids, rotation about a fixed tilted axis.
++struct Trajectory
++{
++	Vector3d center{0.2, 1.1, -0.4};
++	Vector3d amp{0.15, 0.10, 0.12};
++	Vector3d freq{0.9, 1.3, 0.7}; // Hz
++	Vector3d axis = Vector3d(0.3, 1.0, 0.2).normalized();
++	double rot_amp = 0.8;  // rad
++	double rot_freq = 0.6; // Hz
++	bool moving = true;
++
++	Vector3d
++	pos(double t) const
++	{
++		if (!moving) {
++			return center;
++		}
++		Vector3d p;
++		for (int i = 0; i < 3; i++) {
++			p[i] = center[i] + amp[i] * std::sin(2 * M_PI * freq[i] * t);
++		}
++		return p;
++	}
++
++	Vector3d
++	accel(double t) const
++	{
++		if (!moving) {
++			return Vector3d::Zero();
++		}
++		Vector3d a;
++		for (int i = 0; i < 3; i++) {
++			double w = 2 * M_PI * freq[i];
++			a[i] = -amp[i] * w * w * std::sin(w * t);
++		}
++		return a;
++	}
++
++	double
++	angle(double t) const
++	{
++		return moving ? rot_amp * std::sin(2 * M_PI * rot_freq * t) : 0.3;
++	}
++
++	double
++	angle_rate(double t) const
++	{
++		double w = 2 * M_PI * rot_freq;
++		return moving ? rot_amp * w * std::cos(w * t) : 0.0;
++	}
++
++	Quaterniond
++	rot(double t) const
++	{
++		return Quaterniond(Eigen::AngleAxisd(angle(t), axis));
++	}
++};
++
++struct Sim
++{
++	Trajectory traj;
++	std::mt19937 rng{1234};
++	std::normal_distribution<double> unit{0.0, 1.0};
++
++	Vector3d gyro_bias{0.02, -0.015, 0.01};
++	Vector3d accel_bias{0.15, -0.1, 0.2};
++	double gyro_noise = 0.003; // per sample std dev
++	double accel_noise = 0.05; // per sample std dev
++
++	rift_s_ctrl_fusion *fusion = nullptr;
++
++	//! Fixes are delivered this long after exposure; exposures inside [drop_from, drop_to) are lost
++	int64_t drop_from = -1;
++	int64_t drop_to = -1;
++
++	struct PendingFix
++	{
++		int64_t exposure;
++		int64_t deliver;
++		xrt_pose pose;
++	};
++	std::deque<PendingFix> pending;
++
++	//! Last delivered optical position, the "no fusion" baseline
++	bool have_last_fix = false;
++	Vector3d last_fix_pos{0, 0, 0};
++
++	std::vector<rift_s_ctrl_fusion_pose_result> results;
++
++	Sim()
++	{
++		rift_s_ctrl_fusion_params params;
++		rift_s_ctrl_fusion_default_params(&params);
++		fusion = rift_s_ctrl_fusion_create(&params);
++	}
++
++	~Sim()
++	{
++		rift_s_ctrl_fusion_destroy(&fusion);
++	}
++
++	Vector3d
++	noise3(double sigma)
++	{
++		return Vector3d(unit(rng), unit(rng), unit(rng)) * sigma;
++	}
++
++	void
++	feed_imu(int64_t t_ns)
++	{
++		double t = s_of(t_ns);
++		Quaterniond q = traj.rot(t);
++		Vector3d w_body = traj.axis * traj.angle_rate(t); // fixed axis: body rate == world rate
++		Vector3d f_body = q.conjugate() * (traj.accel(t) + Vector3d(0, kGravity, 0));
++
++		Vector3d gyro = w_body + gyro_bias + noise3(gyro_noise);
++		Vector3d accel = f_body + accel_bias + noise3(accel_noise);
++
++		xrt_vec3 g{(float)gyro.x(), (float)gyro.y(), (float)gyro.z()};
++		xrt_vec3 a{(float)accel.x(), (float)accel.y(), (float)accel.z()};
++		rift_s_ctrl_fusion_imu(fusion, t_ns, &g, &a);
++	}
++
++	xrt_pose
++	optical_pose(int64_t t_ns)
++	{
++		double t = s_of(t_ns);
++		Vector3d p = traj.pos(t) + noise3(kOpticalPosSigma);
++		Vector3d dtheta = noise3(kOpticalRotSigma);
++		Quaterniond q = traj.rot(t) * Quaterniond(Eigen::AngleAxisd(dtheta.norm(), dtheta.normalized()));
++		xrt_pose pose;
++		pose.position = {(float)p.x(), (float)p.y(), (float)p.z()};
++		pose.orientation = {(float)q.x(), (float)q.y(), (float)q.z(), (float)q.w()};
++		return pose;
++	}
++
++	void
++	schedule_fix(int64_t exposure_ns)
++	{
++		if (exposure_ns >= drop_from && exposure_ns < drop_to) {
++			return;
++		}
++		pending.push_back({exposure_ns, exposure_ns + kFixDelay, optical_pose(exposure_ns)});
++	}
++
++	void
++	deliver_due(int64_t now_ns)
++	{
++		while (!pending.empty() && pending.front().deliver <= now_ns) {
++			PendingFix f = pending.front();
++			pending.pop_front();
++			results.push_back(rift_s_ctrl_fusion_pose(fusion, f.exposure, &f.pose));
++			have_last_fix = true;
++			last_fix_pos = Vector3d(f.pose.position.x, f.pose.position.y, f.pose.position.z);
++		}
++	}
++
++	//! Advance one IMU tick: feed IMU, schedule fixes on exposure ticks, deliver due fixes.
++	void
++	tick(int64_t now_ns)
++	{
++		feed_imu(now_ns);
++		if (now_ns % kFixPeriod < kImuPeriod) {
++			schedule_fix(now_ns);
++		}
++		deliver_due(now_ns);
++	}
++
++	Vector3d
++	fused_pos(int64_t at_ns, xrt_space_relation *out_rel = nullptr)
++	{
++		xrt_space_relation rel{};
++		bool ok = rift_s_ctrl_fusion_get_relation(fusion, at_ns, &rel);
++		REQUIRE(ok);
++		if (out_rel != nullptr) {
++			*out_rel = rel;
++		}
++		return Vector3d(rel.pose.position.x, rel.pose.position.y, rel.pose.position.z);
++	}
++
++	Quaterniond
++	fused_rot(int64_t at_ns)
++	{
++		xrt_space_relation rel{};
++		REQUIRE(rift_s_ctrl_fusion_get_relation(fusion, at_ns, &rel));
++		return Quaterniond(rel.pose.orientation.w, rel.pose.orientation.x, rel.pose.orientation.y,
++		                   rel.pose.orientation.z);
++	}
++};
++
++struct ErrorStats
++{
++	double sum_sq = 0;
++	double max = 0;
++	int n = 0;
++
++	void
++	add(double e)
++	{
++		sum_sq += e * e;
++		max = std::max(max, e);
++		n++;
++	}
++
++	double
++	rms() const
++	{
++		return n > 0 ? std::sqrt(sum_sq / n) : 0.0;
++	}
++};
++
++constexpr int64_t kWarmup = 2000 * kMs;
++
++} // namespace
++
++TEST_CASE("rift_s_ctrl_fusion: not initialised before an optical fix")
++{
++	Sim sim;
++	for (int64_t t = kImuPeriod; t < 100 * kMs; t += kImuPeriod) {
++		sim.feed_imu(t);
++	}
++	xrt_space_relation rel{};
++	CHECK_FALSE(rift_s_ctrl_fusion_get_relation(sim.fusion, 100 * kMs, &rel));
++	CHECK_FALSE(rift_s_ctrl_fusion_is_initialised(sim.fusion));
++}
++
++TEST_CASE("rift_s_ctrl_fusion: static controller is smoother than raw optical")
++{
++	Sim sim;
++	sim.traj.moving = false;
++	ErrorStats err;
++	for (int64_t t = kImuPeriod; t < 6000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++		if (t > kWarmup) {
++			err.add((sim.fused_pos(t) - sim.traj.pos(s_of(t))).norm());
++		}
++	}
++	INFO("static rms " << err.rms() << " max " << err.max);
++	// Raw optical noise is 3 mm per axis, ~5.2 mm 3D RMS; require at least 40% smoothing
++	CHECK(err.rms() < 0.6 * std::sqrt(3.0) * kOpticalPosSigma);
++	CHECK(err.max < 0.010);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: moving controller beats the last-fix baseline")
++{
++	Sim sim;
++	ErrorStats fused, baseline, fused_rot;
++	for (int64_t t = kImuPeriod; t < 8000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++		if (t > kWarmup) {
++			Vector3d truth = sim.traj.pos(s_of(t));
++			fused.add((sim.fused_pos(t) - truth).norm());
++			baseline.add((sim.last_fix_pos - truth).norm());
++			Quaterniond dq = sim.traj.rot(s_of(t)).conjugate() * sim.fused_rot(t);
++			fused_rot.add(2 * std::acos(std::min(1.0, std::fabs(dq.w()))));
++		}
++	}
++	INFO("fused rms " << fused.rms() << " baseline rms " << baseline.rms() << " rot rms " << fused_rot.rms());
++	CHECK(fused.rms() < 0.005);
++	CHECK(fused.rms() < 0.25 * baseline.rms());
++	CHECK(fused_rot.rms() < 0.02);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: forward prediction to display time")
++{
++	Sim sim;
++	const int64_t horizon = 30 * kMs;
++	ErrorStats predicted, baseline;
++	for (int64_t t = kImuPeriod; t < 8000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++		if (t > kWarmup) {
++			Vector3d truth = sim.traj.pos(s_of(t + horizon));
++			predicted.add((sim.fused_pos(t + horizon) - truth).norm());
++			baseline.add((sim.last_fix_pos - truth).norm());
++		}
++	}
++	INFO("predicted rms " << predicted.rms() << " baseline rms " << baseline.rms());
++	CHECK(predicted.rms() < 0.3 * baseline.rms());
++}
++
++TEST_CASE("rift_s_ctrl_fusion: past-time queries give accurate priors")
++{
++	Sim sim;
++	ErrorStats past;
++	for (int64_t t = kImuPeriod; t < 6000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++		if (t > kWarmup) {
++			int64_t at = t - 40 * kMs;
++			past.add((sim.fused_pos(at) - sim.traj.pos(s_of(at))).norm());
++		}
++	}
++	INFO("past rms " << past.rms());
++	CHECK(past.rms() < 0.005);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: short occlusion is bridged and recovers")
++{
++	Sim sim;
++	const int64_t occl_start = 4000 * kMs;
++	const int64_t occl_end = occl_start + 300 * kMs;
++	sim.drop_from = occl_start;
++	sim.drop_to = occl_end;
++
++	ErrorStats during, after, baseline_during;
++	for (int64_t t = kImuPeriod; t < 6000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++		Vector3d truth = sim.traj.pos(s_of(t));
++		if (t >= occl_start + kFixDelay && t < occl_end + kFixDelay) {
++			during.add((sim.fused_pos(t) - truth).norm());
++			baseline_during.add((sim.last_fix_pos - truth).norm());
++		} else if (t > occl_end + kFixDelay + 150 * kMs) {
++			after.add((sim.fused_pos(t) - truth).norm());
++		}
++	}
++	INFO("during max " << during.max << " baseline during max " << baseline_during.max << " after rms "
++	                   << after.rms());
++	CHECK(during.max < 0.08);
++	CHECK(during.max < 0.8 * baseline_during.max);
++	CHECK(after.rms() < 0.005);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: long occlusion holds position, then re-acquires")
++{
++	Sim sim;
++	const int64_t occl_start = 3000 * kMs;
++	const int64_t occl_end = occl_start + 2000 * kMs;
++	sim.drop_from = occl_start;
++	sim.drop_to = occl_end;
++
++	bool saw_untracked = false;
++	ErrorStats after;
++	for (int64_t t = kImuPeriod; t < 7000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++		if (t < kWarmup) {
++			continue;
++		}
++		xrt_space_relation rel{};
++		Vector3d p = sim.fused_pos(t, &rel);
++		if (t > occl_start + 1000 * kMs && t < occl_end) {
++			CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
++			CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0);
++			saw_untracked = true;
++		}
++		if (t > occl_end + kFixDelay + 200 * kMs) {
++			after.add((p - sim.traj.pos(s_of(t))).norm());
++		}
++	}
++	INFO("after rms " << after.rms());
++	CHECK(saw_untracked);
++	CHECK(after.rms() < 0.005);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: gross outlier fix is rejected")
++{
++	Sim sim;
++	for (int64_t t = kImuPeriod; t < 3000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++	}
++	const int64_t now = 3000 * kMs;
++	Vector3d before = sim.fused_pos(now - 10 * kMs);
++
++	xrt_pose bad = sim.optical_pose(now - 10 * kMs);
++	bad.position.x += 0.5f;
++	CHECK(rift_s_ctrl_fusion_pose(sim.fusion, now - 10 * kMs, &bad) == RIFT_S_CTRL_FUSION_POSE_REJECTED);
++
++	Vector3d after = sim.fused_pos(now - 10 * kMs);
++	CHECK((after - before).norm() < 1e-6);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: repeated far fixes reset the filter")
++{
++	Sim sim;
++	for (int64_t t = kImuPeriod; t < 3000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++	}
++	int64_t t = 3000 * kMs;
++	Vector3d jump(0.6, 0, 0);
++	rift_s_ctrl_fusion_pose_result last = RIFT_S_CTRL_FUSION_POSE_ACCEPTED;
++	for (int i = 0; i < 6 && last != RIFT_S_CTRL_FUSION_POSE_RESET; i++) {
++		xrt_pose p = sim.optical_pose(t);
++		p.position.x += (float)jump.x();
++		last = rift_s_ctrl_fusion_pose(sim.fusion, t, &p);
++		for (int k = 0; k < 16; k++) {
++			t += kImuPeriod;
++			sim.feed_imu(t);
++		}
++	}
++	CHECK(last == RIFT_S_CTRL_FUSION_POSE_RESET);
++	rift_s_ctrl_fusion_stats stats;
++	rift_s_ctrl_fusion_get_stats(sim.fusion, &stats);
++	CHECK(stats.resets >= 2);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: fixes older than the history are ignored")
++{
++	Sim sim;
++	for (int64_t t = kImuPeriod; t < 2000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++	}
++	xrt_pose p = sim.optical_pose(100 * kMs);
++	CHECK(rift_s_ctrl_fusion_pose(sim.fusion, 100 * kMs, &p) == RIFT_S_CTRL_FUSION_POSE_IGNORED);
++}
++
++TEST_CASE("rift_s_ctrl_fusion: biases are estimated")
++{
++	Sim sim;
++	for (int64_t t = kImuPeriod; t < 15000 * kMs; t += kImuPeriod) {
++		sim.tick(t);
++	}
++	rift_s_ctrl_fusion_stats stats;
++	rift_s_ctrl_fusion_get_stats(sim.fusion, &stats);
++	Vector3d bg(stats.gyro_bias.x, stats.gyro_bias.y, stats.gyro_bias.z);
++	INFO("gyro bias est " << bg.transpose() << " true " << sim.gyro_bias.transpose());
++	CHECK((bg - sim.gyro_bias).norm() < 0.01);
++}
+-- 
+2.54.0
+
